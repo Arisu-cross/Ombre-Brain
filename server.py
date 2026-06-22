@@ -34,6 +34,7 @@
 
 import os
 import sys
+import re
 import random
 import logging
 import asyncio
@@ -57,7 +58,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -589,6 +590,32 @@ async def _ensure_related(bucket: dict) -> None:
         logger.warning(f"Auto-link related failed / 自动关联失败 {bucket.get('id', '?')}: {e}")
 
 
+def _extract_todos(bucket: dict) -> list[str]:
+    """提取一个桶的待办：优先读 todos 元字段，再扫描正文中的未勾选 markdown 复选框。
+
+    支持的格式：
+      - todos 元字段（list 或逗号分隔字符串）
+      - 正文行 `- [ ] xxx` / `* [ ] xxx`（仅未勾选；已勾选 [x] 忽略）
+    去重保序。
+    """
+    meta = bucket.get("metadata", {})
+    todos: list[str] = []
+
+    raw = meta.get("todos")
+    if isinstance(raw, str):
+        todos += [t.strip() for t in raw.split(",") if t.strip()]
+    elif isinstance(raw, (list, tuple)):
+        todos += [str(t).strip() for t in raw if str(t).strip()]
+
+    content = bucket.get("content", "") or ""
+    for line in content.splitlines():
+        m = re.match(r"\s*[-*]\s*\[\s\]\s*(.+)", line)
+        if m:
+            todos.append(strip_wikilinks(m.group(1).strip()))
+
+    return list(dict.fromkeys(todos))
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -610,8 +637,9 @@ async def breath(
     mode: str = "summary",
     date_from: str = "",
     date_to: str = "",
+    include_dormant: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     mode = (mode or "summary").strip().lower()
@@ -633,6 +661,7 @@ async def breath(
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
             and _passes_date_filter(b["metadata"], date_from, date_to)
+            and (include_dormant or not b["metadata"].get("dormant"))
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
@@ -693,6 +722,7 @@ async def breath(
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and _passes_date_filter(b["metadata"], date_from, date_to)
+            and (include_dormant or not b["metadata"].get("dormant"))
         ]
 
         logger.info(
@@ -842,6 +872,11 @@ async def breath(
     # --- 按桶更新时间过滤（可与其他参数组合）---
     if date_from or date_to:
         matches = [b for b in matches if _passes_date_filter(b["metadata"], date_from, date_to)]
+
+    # --- E5: hide dormant buckets unless explicitly included ---
+    # --- 默认隐藏休眠桶，除非 include_dormant=True ---
+    if not include_dormant:
+        matches = [b for b in matches if not b["metadata"].get("dormant")]
 
     # --- B4: sort by relevance, cap to max_results, note the overflow ---
     # --- 按相关性排序，只返回前 max_results 个，超出部分末尾附注 ---
@@ -1119,11 +1154,67 @@ async def grow(content: str) -> str:
     return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
 
 
+async def _trace_merge(target_id: str, source_id: str) -> str:
+    """E4：把 source 桶合并进 target 桶。
+
+    内容追加、标签去重、importance 取大、情感取平均，最后删除源桶。
+    钉选/保护桶不能参与 merge。
+    """
+    if target_id == source_id:
+        return "源桶与目标桶相同，无法合并。"
+    target = await bucket_mgr.get(target_id)
+    if not target:
+        return f"未找到目标桶: {target_id}"
+    source = await bucket_mgr.get(source_id)
+    if not source:
+        return f"未找到源桶: {source_id}"
+
+    tm, sm = target["metadata"], source["metadata"]
+    if tm.get("pinned") or tm.get("protected") or sm.get("pinned") or sm.get("protected"):
+        return "merge 不能对钉选/保护桶使用。"
+
+    merged_content = (
+        (target.get("content", "") or "").rstrip()
+        + f"\n\n--- 合并自 {sm.get('name', source_id)}({source_id}) ---\n"
+        + (source.get("content", "") or "").lstrip()
+    )
+    merged_tags = list(dict.fromkeys(list(tm.get("tags", [])) + list(sm.get("tags", []))))
+    merged_imp = max(int(tm.get("importance", 5)), int(sm.get("importance", 5)))
+    merged_val = (float(tm.get("valence", 0.5)) + float(sm.get("valence", 0.5))) / 2
+    merged_aro = (float(tm.get("arousal", 0.3)) + float(sm.get("arousal", 0.3))) / 2
+
+    ok = await bucket_mgr.update(
+        target_id,
+        content=merged_content,
+        tags=merged_tags,
+        importance=merged_imp,
+        valence=merged_val,
+        arousal=merged_aro,
+    )
+    if not ok:
+        return f"合并失败：无法更新目标桶 {target_id}"
+
+    try:
+        await embedding_engine.generate_and_store(target_id, merged_content)
+    except Exception:
+        pass
+
+    del_ok = await bucket_mgr.delete(source_id)
+    if del_ok:
+        embedding_engine.delete_embedding(source_id)
+
+    return (
+        f"已合并 {source_id} → {target_id}"
+        f"（标签{len(merged_tags)}个, 重要度{merged_imp}, V{merged_val:.2f}/A{merged_aro:.2f}）"
+        f"{'，源桶已删除' if del_ok else '，但源桶删除失败'}"
+    )
+
+
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
-# Also handles deletion (delete=True)
-# 同时承接删除功能
+# Also handles deletion (delete=True), batch ops, and merge.
+# 同时承接删除、批量操作、合并功能
 # =============================================================
 @mcp.tool()
 async def trace(
@@ -1139,45 +1230,82 @@ async def trace(
     digested: int = -1,
     content: str = "",
     delete: bool = False,
+    merge: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏/0取消,content=替换正文,delete=True删除。只传需改的,-1或空=不改。bucket_id支持逗号分隔多个ID批量操作(批量模式下content和name忽略)。merge=另一个bucket_id时,把该源桶合并进bucket_id(内容追加/标签去重/重要度取大/情感取平均/删源桶,钉选桶不可merge)。dormant休眠桶始终可被trace访问修改。"""
 
-    if not bucket_id or not bucket_id.strip():
+    ids = [x.strip() for x in (bucket_id or "").split(",") if x.strip()]
+    if not ids:
         return "请提供有效的 bucket_id。"
 
-    # --- Delete mode / 删除模式 ---
-    if delete:
-        success = await bucket_mgr.delete(bucket_id)
-        if success:
-            embedding_engine.delete_embedding(bucket_id)
-        return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
+    # --- E4: merge mode / 合并模式 ---
+    if merge and merge.strip():
+        return await _trace_merge(ids[0], merge.strip())
 
+    is_batch = len(ids) > 1
+
+    # --- Delete mode (batch-aware) / 删除模式（支持批量）---
+    if delete:
+        results = []
+        for bid in ids:
+            ok = await bucket_mgr.delete(bid)
+            if ok:
+                embedding_engine.delete_embedding(bid)
+            results.append(f"{'已遗忘' if ok else '未找到'}:{bid}")
+        return " | ".join(results) if is_batch else (
+            f"已遗忘记忆桶: {ids[0]}" if "已遗忘" in results[0] else f"未找到记忆桶: {ids[0]}"
+        )
+
+    # --- Collect fields shared by single & batch (excludes name/content) ---
+    # --- 收集单条/批量通用字段（不含 name/content）---
+    common = {}
+    if domain:
+        common["domain"] = [d.strip() for d in domain.split(",") if d.strip()]
+    if 0 <= valence <= 1:
+        common["valence"] = valence
+    if 0 <= arousal <= 1:
+        common["arousal"] = arousal
+    if 1 <= importance <= 10:
+        common["importance"] = importance
+    if tags:
+        common["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    if resolved in (0, 1):
+        common["resolved"] = bool(resolved)
+    if pinned in (0, 1):
+        common["pinned"] = bool(pinned)
+        if pinned == 1:
+            common["importance"] = 10  # pinned → lock importance
+    if digested in (0, 1):
+        common["digested"] = bool(digested)
+
+    # --- E3: batch mode (name & content ignored) / 批量模式（忽略 name/content）---
+    if is_batch:
+        if not common:
+            return "批量模式下没有可修改的字段（name 和 content 在批量模式下被忽略）。"
+        results = []
+        ok_count = 0
+        for bid in ids:
+            b = await bucket_mgr.get(bid)
+            if not b:
+                results.append(f"未找到:{bid}")
+                continue
+            if await bucket_mgr.update(bid, **common):
+                ok_count += 1
+                results.append(f"已修改:{bid}")
+            else:
+                results.append(f"失败:{bid}")
+        changed = ", ".join(f"{k}={v}" for k, v in common.items())
+        return f"批量修改 {ok_count}/{len(ids)} 桶 [{changed}]:\n" + " | ".join(results)
+
+    # --- Single mode / 单桶模式 ---
+    bucket_id = ids[0]
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
 
-    # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
-    updates = {}
+    updates = dict(common)
     if name:
         updates["name"] = name
-    if domain:
-        updates["domain"] = [d.strip() for d in domain.split(",") if d.strip()]
-    if 0 <= valence <= 1:
-        updates["valence"] = valence
-    if 0 <= arousal <= 1:
-        updates["arousal"] = arousal
-    if 1 <= importance <= 10:
-        updates["importance"] = importance
-    if tags:
-        updates["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-    if resolved in (0, 1):
-        updates["resolved"] = bool(resolved)
-    if pinned in (0, 1):
-        updates["pinned"] = bool(pinned)
-        if pinned == 1:
-            updates["importance"] = 10  # pinned → lock importance
-    if digested in (0, 1):
-        updates["digested"] = bool(digested)
     if content:
         updates["content"] = content
 
@@ -1243,6 +1371,13 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空。"
 
+    # --- E5: hide dormant buckets from default pulse (show_all reveals them) ---
+    # --- 默认隐藏休眠桶；show_all=True 时一并显示 ---
+    if not show_all:
+        buckets = [b for b in buckets if not b.get("metadata", {}).get("dormant")]
+    if not buckets:
+        return status + "\n记忆库为空（仅有休眠桶，show_all=True 查看）。"
+
     # --- B2: default view = all pinned + top 15 non-pinned by weight ---
     # --- 默认视图：全部钉选桶 + 非钉选桶按权重排序前 15 个 ---
     def _is_pinned(b):
@@ -1284,6 +1419,8 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
+        if meta.get("dormant"):
+            resolved_tag += " [休眠]"
         lines.append(
             f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
             f"bucket_id:{b['id']} "
@@ -1436,6 +1573,108 @@ async def dream(detail_ids: str = "") -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool 7: todos — Pending action items across unresolved buckets
+# 工具 7：todos — 汇总未解决桶里的待办事项
+# =============================================================
+@mcp.tool()
+async def todos() -> str:
+    """汇总所有未 resolved 桶的待办事项,按桶分组返回(附桶名+重要度)。待办来源:桶的 todos 元字段 + 正文中未勾选的 markdown 复选框 `- [ ]`。"""
+    await decay_engine.ensure_started()
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return f"记忆系统暂时无法访问: {e}"
+
+    groups = []
+    for b in all_buckets:
+        meta = b["metadata"]
+        if meta.get("resolved", False):
+            continue
+        items = _extract_todos(b)
+        if items:
+            groups.append((b, items))
+
+    if not groups:
+        return "没有未完成的待办事项。"
+
+    # 按重要度降序分组
+    groups.sort(key=lambda g: int(g[0]["metadata"].get("importance", 5)), reverse=True)
+
+    parts = []
+    total = 0
+    for b, items in groups:
+        meta = b["metadata"]
+        total += len(items)
+        head = (
+            f"[{meta.get('name', b['id'])}] "
+            f"重要:{meta.get('importance', '?')} "
+            f"bucket_id:{b['id']}"
+        )
+        body = "\n".join(f"  ☐ {it}" for it in items)
+        parts.append(head + "\n" + body)
+
+    return f"=== 待办清单（{len(groups)}桶 / {total}项）===\n" + "\n".join(parts)
+
+
+# =============================================================
+# Tool 8: archive_session — Persist a conversation summary into archive
+# 工具 8：archive_session — 将对话摘要存入归档
+# =============================================================
+@mcp.tool()
+async def archive_session(
+    summary: str,
+    highlights: str = "",
+    mood: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+) -> str:
+    """将对话摘要存入归档区。summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。"""
+    if not summary or not summary.strip():
+        return "summary 不能为空。"
+    await decay_engine.ensure_started()
+
+    parts = [f"# 会话摘要\n{summary.strip()}"]
+    if highlights and highlights.strip():
+        parts.append(f"\n## 亮点\n{highlights.strip()}")
+    if mood and mood.strip():
+        parts.append(f"\n## 心情\n{mood.strip()}")
+    content = "\n".join(parts)
+
+    v = valence if 0 <= valence <= 1 else 0.5
+    a = arousal if 0 <= arousal <= 1 else 0.3
+    name = f"会话归档 {now_iso()[:16].replace('T', ' ')}"
+
+    try:
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=["会话", "归档", "session"],
+            importance=4,
+            domain=["归档"],
+            valence=v,
+            arousal=a,
+            name=name,
+            bucket_type="dynamic",
+        )
+    except Exception as e:
+        logger.error(f"archive_session create failed: {e}")
+        return f"归档失败: {e}"
+
+    try:
+        await embedding_engine.generate_and_store(bucket_id, content)
+    except Exception:
+        pass
+
+    archived = False
+    try:
+        archived = await bucket_mgr.archive(bucket_id)
+    except Exception as e:
+        logger.warning(f"archive_session archive move failed: {e}")
+
+    status = "已存入归档" if archived else "已创建(归档移动失败,暂留动态区)"
+    return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}"
 
 
 # =============================================================

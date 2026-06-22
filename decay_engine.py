@@ -190,6 +190,7 @@ class DecayEngine:
         checked = 0
         archived = 0
         auto_resolved = 0
+        dormant_marked = 0
         lowest_score = float("inf")
 
         for bucket in buckets:
@@ -201,6 +202,34 @@ class DecayEngine:
                 continue
 
             checked += 1
+
+            # --- E5: dormant parking — idle >30 days + importance < 3 (non-pinned) ---
+            # --- 休眠：超过30天未访问 + 重要度<3 的非钉选桶 → 标记 dormant ---
+            # Dormant buckets stay in dynamic/ (hidden from pulse/breath, recoverable
+            # on hit/modify) rather than being auto-resolved/archived. Already-dormant
+            # buckets are kept parked (skip resolve/archive) until something wakes them.
+            # 休眠桶留在 dynamic/（pulse/breath 默认隐藏，命中或修改即唤醒），
+            # 不走自动结案/归档；已休眠的桶保持驻留直至被唤醒。
+            last_active_str = meta.get("last_active", meta.get("created", ""))
+            try:
+                _la = datetime.fromisoformat(str(last_active_str))
+                days_idle = (datetime.now() - _la).total_seconds() / 86400
+            except (ValueError, TypeError):
+                days_idle = 999
+            if meta.get("dormant"):
+                continue  # already parked — leave it dormant until hit/modified
+            if int(meta.get("importance", 5)) < 3 and days_idle > 30:
+                try:
+                    if await self.bucket_mgr.set_dormant(bucket["id"], True):
+                        dormant_marked += 1
+                        logger.info(
+                            f"Marked dormant / 标记休眠: "
+                            f"{meta.get('name', bucket['id'])} "
+                            f"(imp={meta.get('importance')}, idle={days_idle:.0f}d)"
+                        )
+                except Exception as e:
+                    logger.warning(f"Mark dormant failed / 标记休眠失败: {e}")
+                continue
 
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
@@ -258,6 +287,7 @@ class DecayEngine:
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
+            "dormant_marked": dormant_marked,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")

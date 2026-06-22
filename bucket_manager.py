@@ -285,6 +285,7 @@ class BucketManager:
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
+        post.metadata.pop("dormant", None)  # E5: a modification wakes a dormant bucket
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -352,6 +353,39 @@ class BucketManager:
         return True
 
     # ---------------------------------------------------------
+    # Set / clear 'dormant' flag WITHOUT bumping last_active
+    # 设置/解除 dormant 休眠标记，不刷新激活时间
+    # ---------------------------------------------------------
+    async def set_dormant(self, bucket_id: str, value: bool) -> bool:
+        """
+        Mark/unmark a bucket as dormant. Does NOT touch last_active
+        (decay marks dormancy based on idleness; bumping the timer would
+        immediately make it non-dormant-eligible).
+        标记/解除桶的休眠状态，不修改 last_active。
+        """
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return False
+        try:
+            post = frontmatter.load(file_path)
+        except Exception as e:
+            logger.warning(f"Failed to load bucket for set_dormant / 加载桶失败: {file_path}: {e}")
+            return False
+
+        if value:
+            post["dormant"] = True
+        else:
+            post.metadata.pop("dormant", None)
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"Failed to write set_dormant / 写入 dormant 失败: {file_path}: {e}")
+            return False
+        return True
+
+    # ---------------------------------------------------------
     # Wikilink injection — DISABLED
     # 自动添加 Obsidian 双链 — 已禁用
     # Now handled by LLM prompts (Gemini adds [[]] for proper nouns)
@@ -405,6 +439,7 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
+            post.metadata.pop("dormant", None)  # E5: a hit wakes a dormant bucket
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
