@@ -15,6 +15,8 @@
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
+| `OMBRE_EMBEDDING_API_KEY` | 否 | — | 向量嵌入专用 API Key（覆盖 `embedding.api_key`）；留空则回退复用 `OMBRE_API_KEY`。需要嵌入与脱水走不同供应商/密钥时设置 |
+| `OMBRE_EMBEDDING_ENABLED` | 否 | `true` | 向量嵌入开关；设为 `false`/`0`/`no`/`off` 关闭语义检索，`breath` 自动降级为纯关键词匹配 |
 | `OMBRE_BACKUP_TOKEN` | 否 | — | 推送备份用的 GitHub 个人访问令牌（需 `repo` 权限）。未设置则尝试 `GITHUB_TOKEN`；都没有时跳过备份 |
 | `OMBRE_BACKUP_REPO` | 否 | `xinyi010524-blip/ob-backup` | 备份目标私有仓库 `owner/name` |
 | `OMBRE_BACKUP_BRANCH` | 否 | `main` | 备份推送的目标分支 |
