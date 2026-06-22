@@ -56,6 +56,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from backup_engine import BackupEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -102,6 +103,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+backup_engine = BackupEngine(config, bucket_mgr)     # Daily backup engine / 每日备份引擎
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -305,12 +307,22 @@ async def root_redirect(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import JSONResponse
+    # Lazy-start the daily backup scheduler. In HTTP mode /health is pinged
+    # by the keepalive loop every 60s, so this reliably starts the scheduler
+    # shortly after boot.
+    # 懒启动每日备份调度器：HTTP 模式下 /health 每 60 秒被保活循环 ping，
+    # 因此服务启动后不久即可拉起调度器。
+    try:
+        await backup_engine.ensure_started()
+    except Exception as e:
+        logger.warning(f"Backup scheduler start failed / 备份调度启动失败: {e}")
     try:
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "backup_scheduler": "running" if backup_engine.is_running else "stopped",
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -1903,6 +1915,51 @@ async def api_system_status(request):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# /api/backup — daily full-store backup
+# /api/backup — 每日全库备份
+#
+# POST /api/backup/run    Manually trigger an export → commit → push now.
+# GET  /api/backup/status Scheduler state + last run result.
+# =============================================================
+@mcp.custom_route("/api/backup/run", methods=["POST"])
+async def api_backup_run(request):
+    """Manually trigger a full-store export and push to the backup repo."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    # Make sure the scheduler is alive too, so the next daily run is armed.
+    try:
+        await backup_engine.ensure_started()
+    except Exception:
+        pass
+    try:
+        result = await backup_engine.run_backup()
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as e:
+        logger.error(f"Manual backup failed / 手动备份失败: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/backup/status", methods=["GET"])
+async def api_backup_status(request):
+    """Return backup scheduler state and the last run result."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    return JSONResponse({
+        "scheduler": "running" if backup_engine.is_running else "stopped",
+        "configured": backup_engine.configured,
+        "repo": backup_engine.repo,
+        "branch": backup_engine.branch,
+        "subdir": backup_engine.backup_subdir,
+        "daily_at": f"{backup_engine.run_hour:02d}:{backup_engine.run_minute:02d}",
+        "last_result": backup_engine.last_result,
+    })
 
 
 # --- Entry point / 启动入口 ---

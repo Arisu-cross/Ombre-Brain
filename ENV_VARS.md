@@ -15,6 +15,23 @@
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
+| `OMBRE_BACKUP_TOKEN` | 否 | — | 推送备份用的 GitHub 个人访问令牌（需 `repo` 权限）。未设置则尝试 `GITHUB_TOKEN`；都没有时跳过备份 |
+| `OMBRE_BACKUP_REPO` | 否 | `xinyi010524-blip/ob-backup` | 备份目标私有仓库 `owner/name` |
+| `OMBRE_BACKUP_BRANCH` | 否 | `main` | 备份推送的目标分支 |
+| `OMBRE_BACKUP_SUBDIR` | 否 | `backups` | 备份 JSON 在仓库内的子目录，也是 `git add` 的**唯一**范围（避免误提交 workflow 文件） |
+| `OMBRE_BACKUP_TIME` | 否 | `00:10` | 每日定时备份时间 `HH:MM`（24 小时制，按服务器本地时区） |
+| `OMBRE_BACKUP_WORKDIR` | 否 | `{buckets_dir}/.ob-backup-repo` | 备份仓库本地克隆目录（默认放在 buckets 目录下，随持久化磁盘保留） |
+| `OMBRE_BACKUP_GIT_NAME` | 否 | `Ombre Brain Backup` | 备份 commit 的 author name |
+| `OMBRE_BACKUP_GIT_EMAIL` | 否 | `ombre-backup@users.noreply.github.com` | 备份 commit 的 author email |
+
+## 每日全库备份 (`OMBRE_BACKUP_*`)
+
+服务每天在 `OMBRE_BACKUP_TIME`（默认 `00:10`）将全库（所有桶 + 归档 + feel + 情绪坐标 valence/arousal）导出为单个 JSON，commit 并 push 到独立私有仓库，文件按日期命名 `backup-YYYY-MM-DD.json`，保留全部历史版本。
+
+- 调度器在服务启动后随首个 `/health` 命中懒启动（HTTP 模式下保活循环每 60 秒会 ping `/health`）。
+- 手动触发：`POST /api/backup/run`（需 Dashboard 认证）。
+- 查看状态：`GET /api/backup/status`。
+- **`git add` 范围被严格限定为 `OMBRE_BACKUP_SUBDIR`**（默认 `backups/`），绝不暂存仓库根目录或 `.github/workflows/`，以免触发 GitHub Actions 默认 token 无 `workflow` 权限导致 push 被拒。
 
 ## 说明
 
