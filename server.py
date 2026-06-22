@@ -497,6 +497,25 @@ async def _merge_or_create(
     return bucket_id, False
 
 
+def _summary_line(b: dict, prefix: str = "") -> str:
+    """单行摘要：bucket_id + 桶名 + 主题 + 情感坐标 + 重要度 + 更新时间。
+
+    省 Token 模式下用它替代脱水全文，每个桶只占一行。
+    """
+    meta = b.get("metadata", {})
+    name = meta.get("name", b["id"])
+    domains = ",".join(meta.get("domain", [])) or "-"
+    val = meta.get("valence", 0.5)
+    aro = meta.get("arousal", 0.3)
+    imp = meta.get("importance", "?")
+    updated = meta.get("last_active", meta.get("created", "")) or "-"
+    return (
+        f"{prefix}[bucket_id:{b['id']}] [{name}] "
+        f"主题:{domains} 情感:V{val:.1f}/A{aro:.1f} "
+        f"重要:{imp} 更新:{updated}"
+    )
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -513,12 +532,16 @@ async def breath(
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
-    max_results: int = 20,
+    max_results: int = 5,
     importance_min: int = -1,
+    mode: str = "summary",
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
+    mode = (mode or "summary").strip().lower()
+    if mode not in ("summary", "full"):
+        mode = "summary"
     max_tokens = min(max_tokens, 20000)
 
     # --- importance_min mode: bulk fetch by importance threshold ---
@@ -573,6 +596,9 @@ async def breath(
         pinned_results = []
         for b in pinned_buckets:
             try:
+                if mode == "summary":
+                    pinned_results.append(_summary_line(b, prefix="📌 [核心准则] "))
+                    continue
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                 pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
@@ -643,13 +669,21 @@ async def breath(
             if token_budget <= 0:
                 break
             try:
+                score = decay_engine.calculate_score(b["metadata"])
+                if mode == "summary":
+                    line = _summary_line(b, prefix=f"[权重:{score:.2f}] ")
+                    line_tokens = count_tokens_approx(line)
+                    if line_tokens > token_budget:
+                        break
+                    dynamic_results.append(line)
+                    token_budget -= line_tokens
+                    continue
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
                     break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
-                score = decay_engine.calculate_score(b["metadata"])
                 dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
                 token_budget -= summary_tokens
             except Exception as e:
@@ -725,8 +759,15 @@ async def breath(
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
 
+    # --- B4: sort by relevance, cap to max_results, note the overflow ---
+    # --- 按相关性排序，只返回前 max_results 个，超出部分末尾附注 ---
+    matches.sort(key=lambda b: b.get("score", 0), reverse=True)
+    total_relevant = len(matches)
+    matches = matches[:max_results]
+
     results = []
     token_used = 0
+    displayed = 0
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -749,6 +790,7 @@ async def breath(
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
             token_used += summary_tokens
+            displayed += 1
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
@@ -778,6 +820,11 @@ async def breath(
     if not results:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
         return "未找到相关记忆。"
+
+    # --- B4: overflow note at the very end / 末尾附注超出名额的相关桶 ---
+    not_shown = total_relevant - displayed
+    if not_shown > 0:
+        results.append(f"…还有 {not_shown} 个相关桶未显示（可增大 max_results 查看）")
 
     final_text = "\n---\n".join(results)
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
@@ -1080,8 +1127,8 @@ async def trace(
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
+    """系统状态+记忆桶列表。include_archive=True含归档。默认只显示全部钉选桶+非钉选桶按权重排序前15个,末尾附统计;show_all=True显示全部桶。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -1105,8 +1152,26 @@ async def pulse(include_archive: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空。"
 
+    # --- B2: default view = all pinned + top 15 non-pinned by weight ---
+    # --- 默认视图：全部钉选桶 + 非钉选桶按权重排序前 15 个 ---
+    def _is_pinned(b):
+        m = b.get("metadata", {})
+        return bool(m.get("pinned") or m.get("protected"))
+
+    total_count = len(buckets)
+    if show_all:
+        display_buckets = buckets
+    else:
+        pinned = [b for b in buckets if _is_pinned(b)]
+        non_pinned = [b for b in buckets if not _is_pinned(b)]
+        non_pinned.sort(
+            key=lambda b: decay_engine.calculate_score(b.get("metadata", {})),
+            reverse=True,
+        )
+        display_buckets = pinned + non_pinned[:15]
+
     lines = []
-    for b in buckets:
+    for b in display_buckets:
         meta = b.get("metadata", {})
         if meta.get("pinned") or meta.get("protected"):
             icon = "📌"
@@ -1138,7 +1203,11 @@ async def pulse(include_archive: bool = False) -> str:
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    footer = f"\n=== 统计 ===\n显示 {len(display_buckets)}/{total_count} 个记忆桶"
+    if not show_all and len(display_buckets) < total_count:
+        footer += f"（隐藏 {total_count - len(display_buckets)} 个,show_all=True 查看全部）"
+
+    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines) + footer
 
 
 # =============================================================
@@ -1151,9 +1220,10 @@ async def pulse(include_archive: bool = False) -> str:
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+async def dream(detail_ids: str = "") -> str:
+    """做梦——读取最近新增的记忆桶,供你自省。默认返回最近5个桶的摘要省token;detail_ids(逗号分隔的bucket_id)指定的桶返回全文,其余仅摘要。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
     await decay_engine.ensure_started()
+    detail_set = {d.strip() for d in detail_ids.split(",") if d.strip()}
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -1169,9 +1239,10 @@ async def dream() -> str:
         and not b["metadata"].get("protected", False)
     ]
 
-    # --- Sort by creation time desc, take top 10 ---
+    # --- Sort by creation time desc, take top 5 ---
+    # --- B3: 默认返回最近 5 个桶的摘要，detail_ids 指定的桶返回全文 ---
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:10]
+    recent = candidates[:5]
 
     if not recent:
         return "没有需要消化的新记忆。"
@@ -1184,13 +1255,18 @@ async def dream() -> str:
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         created = meta.get("created", "")
-        parts.append(
+        head = (
             f"[{meta.get('name', b['id'])}]{resolved_tag} "
             f"主题:{domains} V{val:.1f}/A{aro:.1f} "
             f"创建:{created}\n"
-            f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'][:500])}"
+            f"ID: {b['id']}"
         )
+        if b["id"] in detail_set:
+            # 指定桶：返回全文
+            parts.append(head + "\n" + strip_wikilinks(b["content"]))
+        else:
+            # 其余桶：仅摘要（不返回 content 全文）
+            parts.append(head)
 
     header = (
         "=== Dreaming ===\n"
