@@ -638,8 +638,9 @@ async def breath(
     date_from: str = "",
     date_to: str = "",
     include_dormant: bool = False,
+    wake: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,浮现及其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,浮现及其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按最后更新时间降序,默认3-5条,可用max_results显式调整条数),优先级最高。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -663,6 +664,86 @@ async def breath(
         max_tokens = min(max_tokens, 20000)
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
+
+    # --- wake mode: triggered surface — only pinned + recent archived ---
+    # --- wake 唤醒模式：触发式浮现——只返回钉选桶 + 最近归档桶 ---
+    if wake:
+        WAKE_ARCHIVE_DEFAULT = 5  # 默认取 3-5 条最近归档
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
+        except Exception as e:
+            logger.error(f"Failed to list buckets for wake / wake列桶失败: {e}")
+            return "记忆系统暂时无法访问。"
+
+        pinned_buckets = [
+            b for b in all_buckets
+            if b["metadata"].get("pinned") or b["metadata"].get("protected")
+        ]
+        archived_buckets = [
+            b for b in all_buckets if b["metadata"].get("type") == "archived"
+        ]
+        archived_buckets.sort(
+            key=lambda b: str(b["metadata"].get("last_active", b["metadata"].get("created", ""))),
+            reverse=True,
+        )
+        archive_limit = max_results if not auto_results else WAKE_ARCHIVE_DEFAULT
+        archived_buckets = archived_buckets[:archive_limit]
+
+        pinned_results = []
+        for b in pinned_buckets:
+            try:
+                if mode == "summary":
+                    pinned_results.append(_summary_line(b, prefix="📌 [核心准则] "))
+                    continue
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+            except Exception as e:
+                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+                continue
+
+        token_budget = max_tokens
+        for r in pinned_results:
+            token_budget -= count_tokens_approx(r)
+
+        archive_results = []
+        for b in archived_buckets:
+            if token_budget <= 0:
+                break
+            try:
+                if mode == "summary":
+                    line = _summary_line(b, prefix="🗄️ [归档] ")
+                    line_tokens = count_tokens_approx(line)
+                    if line_tokens > token_budget:
+                        break
+                    archive_results.append(line)
+                    token_budget -= line_tokens
+                    continue
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary_tokens = count_tokens_approx(summary)
+                if summary_tokens > token_budget:
+                    break
+                archive_results.append(f"🗄️ [归档] [bucket_id:{b['id']}] {summary}")
+                token_budget -= summary_tokens
+            except Exception as e:
+                logger.warning(f"Failed to dehydrate archived bucket / 归档桶脱水失败: {e}")
+                continue
+
+        if not pinned_results and not archive_results:
+            await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
+            return "唤醒模式：没有钉选记忆，也没有最近归档的记忆。"
+
+        parts = []
+        if pinned_results:
+            parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if archive_results:
+            parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
+        await _fire_webhook(
+            "breath",
+            {"mode": "wake", "pinned": len(pinned_results), "archived": len(archive_results)},
+        )
+        return "\n\n".join(parts)
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---

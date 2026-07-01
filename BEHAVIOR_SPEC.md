@@ -428,6 +428,31 @@ CREATE TABLE embeddings (
 
 ---
 
+### 场景 13：用户带 wake 参数触发轻量唤醒（只要钉选 + 最近归档）
+
+**Claude 行为**：
+```python
+breath(wake=True)
+```
+
+**系统内部发生什么**：
+
+1. `wake=True` → 进入**唤醒模式**，优先级高于 `importance_min`/`query`/`domain` 等其它检索参数，全部忽略
+2. `bucket_mgr.list_all(include_archive=True)` 全量加载（含归档目录）
+3. 筛选钉选桶（`pinned=True` 或 `protected=True`）— 作为核心准则，始终展示
+4. 筛选 `type == "archived"` 的归档桶，按 `last_active`（回退 `created`）降序排列
+5. 截断归档桶条数：`max_results` 未显式传时默认取 **5** 条（3-5 条区间上限）；显式传 `>=1` 则按该值截断
+6. 对每条调用 `dehydrator.dehydrate()`（或 `mode=summary` 时用单行摘要）压缩，按 `max_tokens` 预算截断
+7. 未解决桶（普通权重池）**不参与**唤醒模式，不会出现在结果里
+
+**返回结果**：
+- 都为空时：`"唤醒模式：没有钉选记忆，也没有最近归档的记忆。"`
+- 有内容时：`"=== 核心准则 ===\n📌 ...\n\n=== 最近归档 ===\n🗄️ [归档] [bucket_id:xxx] ..."`
+
+**适用场景**：轻量唤醒/心跳式检查，只想看"雷打不动的原则"和"最近沉下去的记忆"，不想拉出整个权重池
+
+---
+
 ## 三、边界与降级行为
 
 | 场景 | 异常情况 | 降级行为 |
