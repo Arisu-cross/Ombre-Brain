@@ -76,7 +76,7 @@
 
 | 工具 | 关键参数 | 功能 |
 |---|---|---|
-| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min** | 检索/浮现记忆 |
+| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min**, **wake**, **startup** | 检索/浮现记忆 |
 | `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
 | `grow` | content | 日记拆分归档 |
 | `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
@@ -85,10 +85,12 @@
 
 **工具详细行为**
 
-**`breath`** — 三种模式：
+**`breath`** — 五种模式：
 - **浮现模式**（无 query）：无参调用，按衰减引擎活跃度排序返回 top 记忆，钉选桶始终展示；冷启动检测（`activation_count==0 && importance>=8`）的桶最多 2 个插入最前，再 Top-1 固定 + Top-20 随机打乱
 - **检索模式**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
 - **Feel 检索**（`domain="feel"`）：特殊通道，按创建时间倒序返回所有 feel 类型桶，不走评分逻辑
+- **唤醒模式**（`wake=True`）：只返回钉选桶 + 最近归档桶（按 `archived_at` 降序，默认 5 条），忽略其它检索参数
+- **一站式启动**（`startup=True`）：一次调用打包 浮现 + Dreaming + 最近 3 条 feel，替代对话开头三连；优先级最高
 - **重要度批量模式**（`importance_min>=1`）：跳过语义搜索，直接筛选 importance≥importance_min 的桶，按 importance 降序，最多 20 条
 - 若指定 valence，对匹配桶的 valence 微调 ±0.1（情感记忆重构）
 

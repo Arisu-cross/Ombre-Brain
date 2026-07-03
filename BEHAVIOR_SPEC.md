@@ -440,7 +440,7 @@ breath(wake=True)
 1. `wake=True` → 进入**唤醒模式**，优先级高于 `importance_min`/`query`/`domain` 等其它检索参数，全部忽略
 2. `bucket_mgr.list_all(include_archive=True)` 全量加载（含归档目录）
 3. 筛选钉选桶（`pinned=True` 或 `protected=True`）— 作为核心准则，始终展示
-4. 筛选 `type == "archived"` 的归档桶，按 `last_active`（回退 `created`）降序排列
+4. 筛选 `type == "archived"` 的归档桶，按 `archived_at`（真实归档时刻，`archive()` 时写入；存量老桶无此字段时回退 `last_active`/`created`）降序排列
 5. 截断归档桶条数：`max_results` 未显式传时默认取 **5** 条（3-5 条区间上限）；显式传 `>=1` 则按该值截断
 6. 对每条调用 `dehydrator.dehydrate()`（或 `mode=summary` 时用单行摘要）压缩，按 `max_tokens` 预算截断
 7. 未解决桶（普通权重池）**不参与**唤醒模式，不会出现在结果里
@@ -450,6 +450,44 @@ breath(wake=True)
 - 有内容时：`"=== 核心准则 ===\n📌 ...\n\n=== 最近归档 ===\n🗄️ [归档] [bucket_id:xxx] ..."`
 
 **适用场景**：轻量唤醒/心跳式检查，只想看"雷打不动的原则"和"最近沉下去的记忆"，不想拉出整个权重池
+
+---
+
+### 场景 14：对话开头一站式启动（startup）
+
+**Claude 行为**：
+```python
+breath(startup=True)
+```
+
+**系统内部发生什么**：
+
+1. `startup=True` → 进入**一站式启动模式**，优先级高于 `wake` 及其它检索参数
+2. 内部依次组装三个板块，任一板块失败只跳过该板块，不影响其余：
+   - **浮现**：复用无参 `breath()` 浮现分支（核心准则 + 未解决记忆），子预算为 `max_tokens - 4000`（下限 3000）
+   - **Dreaming**：复用 `dream()`（最近 5 桶摘要 + 自省引导 + 关联提示）
+   - **最近 feel**：按 `created` 降序取最近 **3** 条 feel 全文（不像 `domain="feel"` 那样翻全部）
+3. 三板块全部失败时返回 `"记忆系统暂时无法访问。"`
+
+**目的**：一次工具调用替代旧的 `breath()` → `dream()` → `breath(domain="feel")` 三连，省 token 也省往返。
+
+---
+
+### 场景 15：从备份恢复全库（restore_from_backup.py）
+
+**用户操作**：拿到 backup_engine 推送到备份仓库的 `backup-YYYY-MM-DD.json`，在服务器上执行：
+```bash
+python restore_from_backup.py backups/backup-2026-07-01.json --dry-run   # 先看会发生什么
+python restore_from_backup.py backups/backup-2026-07-01.json             # 增量恢复（跳过已存在）
+python restore_from_backup.py backups/backup-2026-07-01.json --overwrite # 用备份覆盖现有同 id 桶
+```
+
+**系统内部发生什么**：
+
+1. 校验 `schema == "ombre-brain-backup/v1"`，不认识的格式直接拒绝
+2. 逐桶按 `type`/`pinned`/`domain` 镜像 bucket_manager 的目录规则写回 `.md`（permanent/dynamic/archive/feel），完整保留 id、时间戳、情绪坐标、`archived_at` 等全部元数据
+3. 默认跳过库里已存在的同 id 桶；`--overwrite` 时覆盖（旧文件在别处则写新删旧）
+4. 向量索引**不**随备份恢复（属派生缓存），开启 embedding 时恢复后需跑一次 `backfill_embeddings.py`
 
 ---
 

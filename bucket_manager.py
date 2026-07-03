@@ -27,6 +27,7 @@
 
 import os
 import math
+import asyncio
 import logging
 import shutil
 from datetime import datetime
@@ -91,6 +92,24 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+
+        # --- Per-bucket write locks / 每桶写锁 ---
+        # 桶文件的修改都是"读→改→写"三步，MCP 调用、后台衰减循环、Dashboard
+        # 可能并发触到同一个桶，不加锁时后写的会静默覆盖先写的改动。
+        # 单进程服务，asyncio.Lock 足够；跨进程部署需换文件锁。
+        self._bucket_locks: dict[str, asyncio.Lock] = {}
+
+        # --- Parse cache for _load_bucket / 桶文件解析缓存 ---
+        # file_path → ((mtime_ns, size), parsed bucket)。文件被改写后
+        # mtime/size 变化即自动失效，无需显式清理；移动/删除的路径不再
+        # 被 walk 到，只留下少量陈旧键，量级与桶数相同，可忽略。
+        self._parse_cache: dict[str, tuple] = {}
+
+    def _lock_for(self, bucket_id: str) -> asyncio.Lock:
+        lock = self._bucket_locks.get(bucket_id)
+        if lock is None:
+            lock = self._bucket_locks.setdefault(bucket_id, asyncio.Lock())
+        return lock
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -241,6 +260,10 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
+        async with self._lock_for(bucket_id):
+            return await self._update_unlocked(bucket_id, **kwargs)
+
+    async def _update_unlocked(self, bucket_id: str, **kwargs) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -326,6 +349,10 @@ class BucketManager:
         overwrite=False 时，已有非空 related 的桶不覆盖。
         Does NOT touch last_active / 不修改 last_active。
         """
+        async with self._lock_for(bucket_id):
+            return await self._set_related_unlocked(bucket_id, related_ids, overwrite)
+
+    async def _set_related_unlocked(self, bucket_id: str, related_ids: list[str], overwrite: bool = False) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -363,6 +390,10 @@ class BucketManager:
         immediately make it non-dormant-eligible).
         标记/解除桶的休眠状态，不修改 last_active。
         """
+        async with self._lock_for(bucket_id):
+            return await self._set_dormant_unlocked(bucket_id, value)
+
+    async def _set_dormant_unlocked(self, bucket_id: str, value: bool) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -405,15 +436,16 @@ class BucketManager:
         Delete a memory bucket file.
         删除指定的记忆桶文件。
         """
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
+        async with self._lock_for(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
 
-        try:
-            os.remove(file_path)
-        except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
-            return False
+            try:
+                os.remove(file_path)
+            except OSError as e:
+                logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+                return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True
@@ -431,21 +463,21 @@ class BucketManager:
         更新桶的最后激活时间和激活次数。
         同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
         """
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return
-
         try:
-            post = frontmatter.load(file_path)
-            post["last_active"] = now_iso()
-            post["activation_count"] = post.get("activation_count", 0) + 1
-            post.metadata.pop("dormant", None)  # E5: a hit wakes a dormant bucket
+            async with self._lock_for(bucket_id):
+                file_path = self._find_bucket_file(bucket_id)
+                if not file_path:
+                    return
+                post = frontmatter.load(file_path)
+                post["last_active"] = now_iso()
+                post["activation_count"] = post.get("activation_count", 0) + 1
+                post.metadata.pop("dormant", None)  # E5: a hit wakes a dormant bucket
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
 
             # --- Time ripple: boost nearby memories within ±48h ---
-            # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
+            # --- 时间涟漪：±48小时内的记忆轻微唤醒（锁外执行，避免长时间占锁）---
             current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
@@ -483,16 +515,17 @@ class BucketManager:
 
             if delta_hours <= hours:
                 # Boost activation_count by 0.3 (fractional), don't change last_active
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
                 try:
-                    post = frontmatter.load(file_path)
-                    current_count = post.get("activation_count", 1)
-                    # Store as float for fractional increments; calculate_score handles it
-                    post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
+                    async with self._lock_for(bucket["id"]):
+                        file_path = self._find_bucket_file(bucket["id"])
+                        if not file_path:
+                            continue
+                        post = frontmatter.load(file_path)
+                        current_count = post.get("activation_count", 1)
+                        # Store as float for fractional increments; calculate_score handles it
+                        post["activation_count"] = round(current_count + 0.3, 1)
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
                     continue
@@ -820,6 +853,10 @@ class BucketManager:
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
         """
+        async with self._lock_for(bucket_id):
+            return await self._archive_unlocked(bucket_id)
+
+    async def _archive_unlocked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -835,7 +872,10 @@ class BucketManager:
             dest = safe_path(archive_subdir, os.path.basename(file_path))
 
             # Update type marker then move file / 更新类型标记后移动文件
+            # archived_at 记录真实归档时刻——last_active 会被后续批量操作重写，
+            # 不能代表"何时沉下去"
             post["type"] = "archived"
+            post["archived_at"] = now_iso()
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
 
@@ -884,15 +924,33 @@ class BucketManager:
     def _load_bucket(self, file_path: str) -> Optional[dict]:
         """
         Parse a Markdown file and return structured bucket data.
+        Parsed results are cached by (mtime_ns, size) so unchanged files
+        skip re-parsing — list_all() walks the whole store on every breath.
         解析 Markdown 文件，返回桶的结构化数据。
+        按 (mtime_ns, size) 缓存解析结果，未变更的文件跳过重复解析。
         """
         try:
-            post = frontmatter.load(file_path)
+            stat = os.stat(file_path)
+            sig = (stat.st_mtime_ns, stat.st_size)
+            cached = self._parse_cache.get(file_path)
+            if cached is not None and cached[0] == sig:
+                bucket = cached[1]
+            else:
+                post = frontmatter.load(file_path)
+                bucket = {
+                    "id": post.get("id", Path(file_path).stem),
+                    "metadata": dict(post.metadata),
+                    "content": post.content,
+                    "path": file_path,
+                }
+                self._parse_cache[file_path] = (sig, bucket)
+            # 返回副本：调用方会就地改 score/metadata（如 _ensure_related），
+            # 不能让这些改动污染缓存
             return {
-                "id": post.get("id", Path(file_path).stem),
-                "metadata": dict(post.metadata),
-                "content": post.content,
-                "path": file_path,
+                "id": bucket["id"],
+                "metadata": dict(bucket["metadata"]),
+                "content": bucket["content"],
+                "path": bucket["path"],
             }
         except Exception as e:
             logger.warning(

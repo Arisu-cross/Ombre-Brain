@@ -4,7 +4,8 @@
 #
 # 验证:
 #   - wake=True 只返回钉选桶 + 最近归档桶,普通未解决桶不出现
-#   - 归档桶按 last_active 降序,默认最多 5 条
+#   - 归档桶按 archived_at(回退 last_active)降序,默认最多 5 条
+#   - archive() 会写入 archived_at,排序优先于 last_active
 #   - 无钉选/无归档时给出空态提示
 # ============================================================
 
@@ -13,11 +14,12 @@ import pytest
 from unittest.mock import patch
 
 
-async def _set_last_active(bucket_mgr, bucket_id, last_active):
-    """Directly patch a bucket's last_active timestamp on disk for deterministic ordering."""
+async def _set_meta(bucket_mgr, bucket_id, **fields):
+    """Directly patch a bucket's frontmatter fields on disk for deterministic ordering."""
     fpath = bucket_mgr._find_bucket_file(bucket_id)
     post = fm.load(fpath)
-    post["last_active"] = last_active
+    for k, v in fields.items():
+        post[k] = v
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(fm.dumps(post))
 
@@ -57,15 +59,15 @@ async def test_wake_returns_pinned_and_archived_only(patched_server, bucket_mgr)
 
 @pytest.mark.asyncio
 async def test_wake_archived_sorted_desc_and_capped(patched_server, bucket_mgr):
-    """归档桶按 last_active 降序，默认最多取 5 条。"""
+    """归档桶按 archived_at 降序，默认最多取 5 条。"""
     ids = []
     for i in range(8):
         bid = await bucket_mgr.create(
             content=f"归档内容{i}", name=f"归档{i}", domain=["日常"], importance=5,
         )
         assert await bucket_mgr.archive(bid)
-        await _set_last_active(bucket_mgr, bid, f"2024-01-{i + 1:02d}T00:00:00")
-        ids.append(bid)  # ids[i] archived with last_active = day (i+1), later = more recent
+        await _set_meta(bucket_mgr, bid, archived_at=f"2024-01-{i + 1:02d}T00:00:00")
+        ids.append(bid)  # ids[i] archived at day (i+1), later = more recent
 
     out = await patched_server.breath(wake=True, mode="summary")
 
@@ -74,6 +76,33 @@ async def test_wake_archived_sorted_desc_and_capped(patched_server, bucket_mgr):
     # most recent (highest day number) should be present, oldest should be trimmed
     assert ids[-1] in out
     assert ids[0] not in out
+
+
+@pytest.mark.asyncio
+async def test_archive_stamps_archived_at(bucket_mgr):
+    """archive() 应写入 archived_at 字段，记录真实归档时刻。"""
+    bid = await bucket_mgr.create(content="待归档", name="待归档", domain=["日常"])
+    assert await bucket_mgr.archive(bid)
+    bucket = await bucket_mgr.get(bid)
+    assert bucket["metadata"].get("archived_at"), "archive() did not stamp archived_at"
+
+
+@pytest.mark.asyncio
+async def test_wake_prefers_archived_at_over_last_active(patched_server, bucket_mgr):
+    """last_active 被批量操作重写时，wake 排序仍按 archived_at 取最近归档。"""
+    old_id = await bucket_mgr.create(content="早归档", name="早归档", domain=["日常"])
+    new_id = await bucket_mgr.create(content="晚归档", name="晚归档", domain=["日常"])
+    assert await bucket_mgr.archive(old_id)
+    assert await bucket_mgr.archive(new_id)
+    # 模拟批量操作把两桶 last_active 刷成同一时刻，且早归档的 last_active 更新
+    await _set_meta(bucket_mgr, old_id,
+                    archived_at="2024-01-01T00:00:00", last_active="2025-12-31T00:00:00")
+    await _set_meta(bucket_mgr, new_id,
+                    archived_at="2024-06-01T00:00:00", last_active="2025-12-31T00:00:00")
+
+    out = await patched_server.breath(wake=True, max_results=1)
+    assert new_id in out, "wake should pick the bucket with the newer archived_at"
+    assert old_id not in out
 
 
 @pytest.mark.asyncio

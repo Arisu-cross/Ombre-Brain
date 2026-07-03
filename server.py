@@ -639,8 +639,9 @@ async def breath(
     date_to: str = "",
     include_dormant: bool = False,
     wake: bool = False,
+    startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,浮现及其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按最后更新时间降序,默认3-5条,可用max_results显式调整条数),优先级最高。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,浮现及其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认3-5条,可用max_results显式调整条数)。startup=True时一站式启动:一次调用打包返回 浮现(核心准则+未解决记忆)+Dreaming最近记忆+最近3条feel,替代对话开头的 breath→dream→breath(feel) 三连,忽略其它检索参数;startup优先于wake。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -665,6 +666,52 @@ async def breath(
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
 
+    # --- startup mode: one-shot session bootstrap ---
+    # --- startup 一站式启动：浮现 + Dreaming + 最近 feel，一次调用替代三连 ---
+    if startup:
+        STARTUP_FEEL_COUNT = 3
+        sections = []
+
+        # 1) 浮现（核心准则 + 未解决记忆）——复用无参 breath 的浮现分支
+        try:
+            surf = await breath(mode=mode, max_tokens=max(3000, max_tokens - 4000))
+            if surf:
+                sections.append(surf)
+        except Exception as e:
+            logger.warning(f"Startup surfacing failed / 启动浮现失败: {e}")
+
+        # 2) Dreaming——最近记忆 + 自省引导（默认摘要，本就便宜）
+        try:
+            dr = await dream()
+            if dr and "无法访问" not in dr:
+                sections.append(dr)
+        except Exception as e:
+            logger.warning(f"Startup dream failed / 启动dream失败: {e}")
+
+        # 3) 最近 feel——只取最近3条，不像 domain="feel" 那样翻全部
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            feels.sort(key=lambda b: str(b["metadata"].get("created", "")), reverse=True)
+            feels = feels[:STARTUP_FEEL_COUNT]
+            if feels:
+                entries = [
+                    f"[{f['metadata'].get('created', '')}] [bucket_id:{f['id']}]\n"
+                    f"{strip_wikilinks(f['content'])}"
+                    for f in feels
+                ]
+                sections.append(
+                    f"=== 你留下的 feel（最近{len(feels)}条）===\n" + "\n---\n".join(entries)
+                )
+        except Exception as e:
+            logger.warning(f"Startup feel retrieval failed / 启动feel读取失败: {e}")
+
+        if not sections:
+            return "记忆系统暂时无法访问。"
+        final_text = "\n\n".join(sections)
+        await _fire_webhook("breath", {"mode": "startup", "sections": len(sections), "chars": len(final_text)})
+        return final_text
+
     # --- wake mode: triggered surface — only pinned + recent archived ---
     # --- wake 唤醒模式：触发式浮现——只返回钉选桶 + 最近归档桶 ---
     if wake:
@@ -682,8 +729,14 @@ async def breath(
         archived_buckets = [
             b for b in all_buckets if b["metadata"].get("type") == "archived"
         ]
+        # 按真实归档时刻排序；存量老桶没有 archived_at 时回退 last_active/created
         archived_buckets.sort(
-            key=lambda b: str(b["metadata"].get("last_active", b["metadata"].get("created", ""))),
+            key=lambda b: str(
+                b["metadata"].get(
+                    "archived_at",
+                    b["metadata"].get("last_active", b["metadata"].get("created", "")),
+                )
+            ),
             reverse=True,
         )
         archive_limit = max_results if not auto_results else WAKE_ARCHIVE_DEFAULT
