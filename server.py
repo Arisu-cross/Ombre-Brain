@@ -1479,7 +1479,7 @@ async def trace(
 # =============================================================
 @mcp.tool()
 async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。默认只显示全部钉选桶+非钉选桶按权重排序前15个,末尾附统计;show_all=True显示全部桶。"""
+    """系统状态+记忆桶列表。include_archive=True含归档。默认只显示全部钉选桶+非钉选桶随机抽样5个(每次调用结果不同),末尾附统计;show_all=True显示全部桶。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -1510,8 +1510,10 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空（仅有休眠桶，show_all=True 查看）。"
 
-    # --- B2: default view = all pinned + top 15 non-pinned by weight ---
-    # --- 默认视图：全部钉选桶 + 非钉选桶按权重排序前 15 个 ---
+    # --- B2: default view = all pinned + 5 random non-pinned (no weight ranking) ---
+    # --- 默认视图：全部钉选桶 + 非钉选桶随机抽样 5 个（不按权重排序，每次调用结果不同）---
+    PULSE_RANDOM_SAMPLE = 5
+
     def _is_pinned(b):
         m = b.get("metadata", {})
         return bool(m.get("pinned") or m.get("protected"))
@@ -1522,11 +1524,8 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     else:
         pinned = [b for b in buckets if _is_pinned(b)]
         non_pinned = [b for b in buckets if not _is_pinned(b)]
-        non_pinned.sort(
-            key=lambda b: decay_engine.calculate_score(b.get("metadata", {})),
-            reverse=True,
-        )
-        display_buckets = pinned + non_pinned[:15]
+        sampled = random.sample(non_pinned, min(PULSE_RANDOM_SAMPLE, len(non_pinned)))
+        display_buckets = pinned + sampled
 
     lines = []
     for b in display_buckets:
