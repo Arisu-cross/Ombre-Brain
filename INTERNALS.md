@@ -24,7 +24,7 @@
 - `created`、`last_active` 时间戳
 
 **四种检索模式**
-1. **自动浮现**（`breath()` 无参数）：按衰减分排序推送，钉选桶始终展示，Top-1 固定 + Top-20 随机打乱（引入多样性），有 token 预算（默认 10000）
+1. **无 query**（`breath()` 无参数）：不做语义浮现，钉选桶始终展示 + 最近记忆按 `last_active` 降序返回，有 token 预算（默认 10000）
 2. **关键词+向量双通道搜索**（`breath(query=...)`）：rapidfuzz 模糊匹配 + Gemini embedding 余弦相似度，合并去重
 3. **Feel 独立检索**（`breath(domain="feel")`）：按创建时间倒序返回所有 feel
 4. **随机浮现**：搜索结果 <3 条时 40% 概率漂浮 1~3 条低权重旧桶（模拟人类随机联想）
@@ -86,11 +86,11 @@
 **工具详细行为**
 
 **`breath`** — 五种模式：
-- **浮现模式**（无 query）：无参调用，按衰减引擎活跃度排序返回 top 记忆，钉选桶始终展示；冷启动检测（`activation_count==0 && importance>=8`）的桶最多 2 个插入最前，再 Top-1 固定 + Top-20 随机打乱
-- **检索模式**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
+- **无 query 模式**：无参调用，不做语义浮现；只返回钉选桶（始终展示）+ 按 `last_active` 降序排列的最近记忆
+- **检索模式（语义浮现）**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
 - **Feel 检索**（`domain="feel"`）：特殊通道，按创建时间倒序返回所有 feel 类型桶，不走评分逻辑
-- **唤醒模式**（`wake=True`）：只返回钉选桶 + 最近归档桶（按 `archived_at` 降序，默认 5 条），忽略其它检索参数
-- **一站式启动**（`startup=True`）：一次调用打包 浮现 + Dreaming + 最近 3 条 feel，替代对话开头三连；优先级最高
+- **唤醒模式**（`wake=True`）：只返回钉选桶 + 最近归档桶（按 `archived_at` 降序，默认 5 条），忽略其它检索参数，不做语义浮现
+- **一站式启动**（`startup=True`）：一次调用打包 核心准则+最近记忆 + Dreaming + 最近 3 条 feel，替代对话开头三连；优先级最高；不传 query，不做语义浮现
 - **重要度批量模式**（`importance_min>=1`）：跳过语义搜索，直接筛选 importance≥importance_min 的桶，按 importance 降序，最多 20 条
 - 若指定 valence，对匹配桶的 valence 微调 ±0.1（情感记忆重构）
 

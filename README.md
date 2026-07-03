@@ -243,8 +243,8 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **自然遗忘 / Natural forgetting**: 改进版艾宾浩斯遗忘曲线。不活跃的记忆自动衰减归档，高情绪强度的记忆衰减更慢。
   Modified Ebbinghaus forgetting curve. Inactive memories naturally decay and archive. High-arousal memories decay slower.
 
-- **权重池浮现 / Weight pool surfacing**: 记忆不是被动检索的，它们会主动浮现——未解决的、情绪强烈的记忆权重更高，会在对话开头自动推送。
-  Memories aren't just passively retrieved — they actively surface. Unresolved, emotionally intense memories carry higher weight and get pushed at conversation start.
+- **权重池浮现 / Weight pool surfacing**: 记忆不是被动检索的，它们会主动浮现——未解决的、情绪强烈的记忆权重更高，检索（`query` 非空）时排名更靠前。对话开头无参数调用只返回钉选桶+最近记忆，不触发语义浮现。
+  Memories aren't just passively retrieved — they actively surface when searched. Unresolved, emotionally intense memories carry higher weight and rank higher when a `query` is given. A no-arg call at conversation start only returns pinned buckets + recent memories, without triggering semantic surfacing.
 
 - **记忆重构 / Memory reconstruction**: 检索时根据当前情绪状态微调记忆的 valence 展示值（±0.1），模拟人类"此刻的心情影响对过去的回忆"的认知偏差。
   During retrieval, memory valence display is subtly shifted (±0.1) based on current mood, simulating the human cognitive bias of "current mood colors past memories".
@@ -316,7 +316,7 @@ breath(query="今天很累")
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。无参数=只返回钉选桶+最近记忆(不做语义浮现)；有参数=关键词+向量语义双通道检索(语义浮现)。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = pinned buckets + recent memories only (no semantic surfacing); with query = keyword + vector dual-channel search (semantic surfacing). Supports domain/valence/arousal filters |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
