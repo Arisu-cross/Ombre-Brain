@@ -332,48 +332,29 @@ async def health_check(request):
 # =============================================================
 # /breath-hook endpoint: Dedicated hook for SessionStart
 # 会话启动专用挂载点
+#
+# Same selection as the no-query breath: pinned buckets + recent
+# archived session summaries. Ordinary dynamic buckets never appear.
+# 与无 query breath 一致：钉选桶 + 最近归档的会话总结，普通动态桶不出现。
 # =============================================================
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        HOOK_ARCHIVE_DEFAULT = 5  # 默认取最近 3-5 条归档的会话总结
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
-        # top 2 unresolved by score
-        unresolved = [b for b in all_buckets
-                      if not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel")
-                      and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
-        scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
+        # recent archived session summaries (written by archive_session), by archive time desc
+        archived = [b for b in all_buckets if b["metadata"].get("type") == "archived"]
+        archived.sort(key=_archived_sort_key, reverse=True)
+        archived = archived[:HOOK_ARCHIVE_DEFAULT]
 
-        parts = []
+        parts = await _render_pinned(pinned, "full")
         token_budget = 10000
-        for b in pinned:
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            parts.append(f"📌 [核心准则] {summary}")
-            token_budget -= count_tokens_approx(summary)
-
-        # Diversity: top-1 fixed + shuffle rest from top-20
-        candidates = list(scored)
-        if len(candidates) > 1:
-            top1 = [candidates[0]]
-            pool = candidates[1:min(20, len(candidates))]
-            random.shuffle(pool)
-            candidates = top1 + pool + candidates[min(20, len(candidates)):]
-        # Hard cap: max 20 surfacing buckets in hook
-        candidates = candidates[:20]
-
-        for b in candidates:
-            if token_budget <= 0:
-                break
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
-            parts.append(summary)
-            token_budget -= summary_tokens
+        for r in parts:
+            token_budget -= count_tokens_approx(r)
+        parts += await _render_archived(archived, "full", token_budget)
 
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})

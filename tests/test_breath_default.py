@@ -8,6 +8,7 @@
 #   - 显式 max_results 覆盖默认归档条数
 #   - 无钉选/无归档时给出空态提示
 #   - startup=True 的浮现板块同理(不带普通动态桶,带最近归档)
+#   - /breath-hook SessionStart 钩子同理(钉选+最近归档,普通桶不出现)
 # ============================================================
 
 import frontmatter as fm
@@ -129,3 +130,25 @@ async def test_startup_surfaces_recent_archived(patched_server, bucket_mgr):
 
     assert archived_id in out
     assert "最近归档" in out
+
+
+@pytest.mark.asyncio
+async def test_breath_hook_returns_pinned_and_archived_only(patched_server, bucket_mgr):
+    """/breath-hook 钩子同理：钉选桶 + 最近归档，普通动态桶不出现。"""
+    pinned_id = await bucket_mgr.create(
+        content="核心准则内容", name="核心准则", domain=["日常"], pinned=True,
+    )
+    archived_id = await bucket_mgr.create(
+        content="上个窗口的会话总结", name="会话总结", domain=["日常"],
+    )
+    assert await bucket_mgr.archive(archived_id)
+    ordinary_id = await bucket_mgr.create(
+        content="普通动态记忆", name="普通记忆", domain=["日常"], importance=8,
+    )
+
+    resp = await patched_server.breath_hook(None)
+    body = resp.body.decode("utf-8")
+
+    assert pinned_id in body
+    assert archived_id in body
+    assert ordinary_id not in body, "ordinary dynamic bucket leaked into breath-hook"
