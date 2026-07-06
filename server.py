@@ -12,8 +12,8 @@
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
 #   - Expose 6 MCP tools:
 #     暴露 6 个 MCP 工具：
-#       breath — Surface unresolved memories or search by keyword
-#                浮现未解决记忆 或 按关键词检索
+#       breath — Surface pinned buckets + recent archived session summaries, or search by keyword
+#                浮现钉选桶 + 最近归档的会话总结，或按关键词检索
 #       hold   — Store a single memory (or write a `feel` reflection)
 #                存储单条记忆（或写 feel 反思）
 #       grow   — Diary digest, auto-split into multiple buckets
@@ -332,48 +332,29 @@ async def health_check(request):
 # =============================================================
 # /breath-hook endpoint: Dedicated hook for SessionStart
 # 会话启动专用挂载点
+#
+# Same selection as the no-query breath: pinned buckets + recent
+# archived session summaries. Ordinary dynamic buckets never appear.
+# 与无 query breath 一致：钉选桶 + 最近归档的会话总结，普通动态桶不出现。
 # =============================================================
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        HOOK_ARCHIVE_DEFAULT = 5  # 默认取最近 3-5 条归档的会话总结
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
-        # top 2 unresolved by score
-        unresolved = [b for b in all_buckets
-                      if not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel")
-                      and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
-        scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
+        # recent archived session summaries (written by archive_session), by archive time desc
+        archived = [b for b in all_buckets if b["metadata"].get("type") == "archived"]
+        archived.sort(key=_archived_sort_key, reverse=True)
+        archived = archived[:HOOK_ARCHIVE_DEFAULT]
 
-        parts = []
+        parts = await _render_pinned(pinned, "full")
         token_budget = 10000
-        for b in pinned:
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            parts.append(f"📌 [核心准则] {summary}")
-            token_budget -= count_tokens_approx(summary)
-
-        # Diversity: top-1 fixed + shuffle rest from top-20
-        candidates = list(scored)
-        if len(candidates) > 1:
-            top1 = [candidates[0]]
-            pool = candidates[1:min(20, len(candidates))]
-            random.shuffle(pool)
-            candidates = top1 + pool + candidates[min(20, len(candidates)):]
-        # Hard cap: max 20 surfacing buckets in hook
-        candidates = candidates[:20]
-
-        for b in candidates:
-            if token_budget <= 0:
-                break
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
-            parts.append(summary)
-            token_budget -= summary_tokens
+        for r in parts:
+            token_budget -= count_tokens_approx(r)
+        parts += await _render_archived(archived, "full", token_budget)
 
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
@@ -534,6 +515,61 @@ def _passes_date_filter(meta: dict, date_from: str, date_to: str) -> bool:
     return True
 
 
+def _archived_sort_key(b: dict) -> str:
+    """归档桶排序键：按真实归档时刻 archived_at 排序。
+
+    存量老桶没有 archived_at 时回退 last_active/created（last_active 可能被
+    后续批量操作重写，所以 archived_at 优先）。
+    """
+    meta = b["metadata"]
+    return str(meta.get("archived_at", meta.get("last_active", meta.get("created", ""))))
+
+
+async def _render_pinned(pinned_buckets: list, mode: str) -> list:
+    """钉选桶 → 核心准则条目（summary 单行 / full 脱水全文）。"""
+    results = []
+    for b in pinned_buckets:
+        try:
+            if mode == "summary":
+                results.append(_summary_line(b, prefix="📌 [核心准则] "))
+                continue
+            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+            results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+        except Exception as e:
+            logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+            continue
+    return results
+
+
+async def _render_archived(archived_buckets: list, mode: str, token_budget: int) -> list:
+    """归档桶 → 最近归档条目，受 token 预算约束。"""
+    results = []
+    for b in archived_buckets:
+        if token_budget <= 0:
+            break
+        try:
+            if mode == "summary":
+                line = _summary_line(b, prefix="🗄️ [归档] ")
+                line_tokens = count_tokens_approx(line)
+                if line_tokens > token_budget:
+                    break
+                results.append(line)
+                token_budget -= line_tokens
+                continue
+            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+            summary_tokens = count_tokens_approx(summary)
+            if summary_tokens > token_budget:
+                break
+            results.append(f"🗄️ [归档] [bucket_id:{b['id']}] {summary}")
+            token_budget -= summary_tokens
+        except Exception as e:
+            logger.warning(f"Failed to dehydrate archived bucket / 归档桶脱水失败: {e}")
+            continue
+    return results
+
+
 async def _related_note(bucket: dict) -> str:
     """D3：若桶存在 related 关联，返回一行关联桶 id+名称的注脚（不展开全文）。
 
@@ -620,8 +656,11 @@ def _extract_todos(bucket: dict) -> list[str]:
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
 #
-# No args: pinned buckets + recent memories, sorted by update time (no semantic surfacing)
-# 无参数：钉选桶 + 最近记忆（按更新时间排序，不做语义浮现）
+# No args: pinned buckets + recent archived session summaries (no semantic surfacing)
+# 无参数：钉选桶 + 最近归档的会话总结（按归档时间降序，不做语义浮现）
+# Ordinary dynamic buckets (written by hold) never appear here — they are
+# only reachable through query-based semantic search.
+# 普通动态桶（hold 写入的）不出现在无 query 的默认返回里，只作为语义搜索的检索库。
 # With args: semantic surfacing — search by keyword + emotion coordinates
 # 有参数：语义浮现——按关键词+情感坐标检索记忆
 # =============================================================
@@ -641,13 +680,12 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=只返回钉选桶+最近记忆(按更新时间排序,不做语义浮现);有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query时最近记忆取前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认3-5条,可用max_results显式调整条数)。startup=True时一站式启动:一次调用打包返回 核心准则+最近记忆+Dreaming最近记忆+最近3条feel,替代对话开头的 breath→dream→breath(feel) 三连,忽略其它检索参数(不做语义浮现);startup优先于wake。"""
+    """检索/浮现记忆。不传query或传空=只返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认最近5条;普通动态桶不出现,只在有query的语义搜索中被检索);有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake时最近归档取5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认3-5条,可用max_results显式调整条数)。startup=True时一站式启动:一次调用打包返回 核心准则+最近归档+Dreaming最近记忆+最近3条feel,替代对话开头的 breath→dream→breath(feel) 三连,忽略其它检索参数(不做语义浮现);startup优先于wake。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
     auto_results = max_results is None or max_results < 1
     if auto_results:
-        SURFACE_AUTO_CAP = 15   # 浮现模式自适应默认条数
         REL_WINDOW = 0.6        # 搜索:保留分数 >= 最高分*0.6 的相关桶
         AUTO_HARD_CAP = 50      # 安全上限,正常情况下 token 预算先触顶
     else:
@@ -672,7 +710,7 @@ async def breath(
         STARTUP_FEEL_COUNT = 3
         sections = []
 
-        # 1) 浮现（核心准则 + 未解决记忆）——复用无参 breath 的浮现分支
+        # 1) 浮现（核心准则 + 最近归档的会话总结）——复用无参 breath 的浮现分支
         try:
             surf = await breath(mode=mode, max_tokens=max(3000, max_tokens - 4000))
             if surf:
@@ -729,59 +767,16 @@ async def breath(
         archived_buckets = [
             b for b in all_buckets if b["metadata"].get("type") == "archived"
         ]
-        # 按真实归档时刻排序；存量老桶没有 archived_at 时回退 last_active/created
-        archived_buckets.sort(
-            key=lambda b: str(
-                b["metadata"].get(
-                    "archived_at",
-                    b["metadata"].get("last_active", b["metadata"].get("created", "")),
-                )
-            ),
-            reverse=True,
-        )
+        archived_buckets.sort(key=_archived_sort_key, reverse=True)
         archive_limit = max_results if not auto_results else WAKE_ARCHIVE_DEFAULT
         archived_buckets = archived_buckets[:archive_limit]
 
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                if mode == "summary":
-                    pinned_results.append(_summary_line(b, prefix="📌 [核心准则] "))
-                    continue
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
+        pinned_results = await _render_pinned(pinned_buckets, mode)
 
         token_budget = max_tokens
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
-
-        archive_results = []
-        for b in archived_buckets:
-            if token_budget <= 0:
-                break
-            try:
-                if mode == "summary":
-                    line = _summary_line(b, prefix="🗄️ [归档] ")
-                    line_tokens = count_tokens_approx(line)
-                    if line_tokens > token_budget:
-                        break
-                    archive_results.append(line)
-                    token_budget -= line_tokens
-                    continue
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
-                    break
-                archive_results.append(f"🗄️ [归档] [bucket_id:{b['id']}] {summary}")
-                token_budget -= summary_tokens
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate archived bucket / 归档桶脱水失败: {e}")
-                continue
+        archive_results = await _render_archived(archived_buckets, mode, token_budget)
 
         if not pinned_results and not archive_results:
             await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
@@ -834,11 +829,15 @@ async def breath(
                 logger.warning(f"importance_min dehydrate failed: {e}")
         return "\n---\n".join(results) if results else "没有可以展示的记忆。"
 
-    # --- No args or empty query: pinned + recent, no semantic surfacing ---
-    # --- 无参数或空query：钉选桶 + 最近记忆，不做语义浮现 ---
+    # --- No args or empty query: pinned + recent archived session summaries ---
+    # --- 无参数或空query：钉选桶 + 最近归档的会话总结，不做语义浮现 ---
+    # 每次新窗口唤醒，读到的应该是"上一个/前几个窗口的会话总结"（archive_session 写入）。
+    # 普通动态桶（hold 写入的）不出现在这里，只作为语义搜索（query 非空）的检索库；
+    # 语义浮现（权重排序/冷启动/多样性采样）见下方 "With args: search mode" 分支。
     if not query or not query.strip():
+        BREATH_ARCHIVE_DEFAULT = 5  # 默认取最近 3-5 条归档的会话总结
         try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
         except Exception as e:
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
@@ -849,81 +848,38 @@ async def breath(
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                if mode == "summary":
-                    pinned_results.append(_summary_line(b, prefix="📌 [核心准则] "))
-                    continue
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
+        pinned_results = await _render_pinned(pinned_buckets, mode)
 
-        # --- No query: plain recent memories, sorted by update time ---
-        # --- 无query：不做权重/语义浮现，只按更新时间排列最近记忆 ---
-        # 语义浮现（权重排序/冷启动/多样性采样）只在 query 非空的检索分支触发,
-        # 见下方 "With args: search mode" 分支。
-        recent = [
+        # --- Recent archived session summaries, by archive time desc ---
+        # --- 最近归档的会话总结：按归档时间降序取最近几条 ---
+        archived_buckets = [
             b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel")
-            and not b["metadata"].get("pinned", False)
-            and not b["metadata"].get("protected", False)
+            if b["metadata"].get("type") == "archived"
             and _passes_date_filter(b["metadata"], date_from, date_to)
             and (include_dormant or not b["metadata"].get("dormant"))
         ]
-        recent.sort(
-            key=lambda b: str(b["metadata"].get("last_active", b["metadata"].get("created", ""))),
-            reverse=True,
-        )
+        archived_buckets.sort(key=_archived_sort_key, reverse=True)
+        archive_limit = max_results if not auto_results else BREATH_ARCHIVE_DEFAULT
+        archived_buckets = archived_buckets[:archive_limit]
 
         logger.info(
             f"Breath (no query): {len(all_buckets)} total, "
-            f"{len(pinned_buckets)} pinned, {len(recent)} recent"
+            f"{len(pinned_buckets)} pinned, {len(archived_buckets)} archived"
         )
 
         token_budget = max_tokens
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
+        archive_results = await _render_archived(archived_buckets, mode, token_budget)
 
-        recent_cap = SURFACE_AUTO_CAP if auto_results else max_results
-        candidates = recent[:recent_cap]
-
-        recent_results = []
-        for b in candidates:
-            if token_budget <= 0:
-                break
-            try:
-                if mode == "summary":
-                    line = _summary_line(b, prefix="🕒 ")
-                    line_tokens = count_tokens_approx(line)
-                    if line_tokens > token_budget:
-                        break
-                    recent_results.append(line)
-                    token_budget -= line_tokens
-                    continue
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
-                    break
-                # NOTE: no touch() here — 浏览最近记忆不应重置衰减计时器
-                recent_results.append(f"[bucket_id:{b['id']}] {summary}")
-                token_budget -= summary_tokens
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate recent bucket / 最近记忆脱水失败: {e}")
-                continue
-
-        if not pinned_results and not recent_results:
-            return "权重池平静，没有需要处理的记忆。"
+        if not pinned_results and not archive_results:
+            return "没有钉选记忆，也没有归档的会话总结。"
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
-        if recent_results:
-            parts.append("=== 最近记忆 ===\n" + "\n---\n".join(recent_results))
+        if archive_results:
+            parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         return "\n\n".join(parts)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
