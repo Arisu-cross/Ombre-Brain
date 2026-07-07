@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # ============================================================
-# SessionStart Hook: auto-breath + dreaming on session start
-# 对话开始钩子：自动浮现记忆 + 触发 dreaming
+# SessionStart Hook: auto-breath on session start
+# 对话开始钩子：自动浮现记忆（只呼吸，不做梦）
 #
 # On SessionStart, this script calls the Ombre Brain MCP server's
-# breath-hook and dream-hook endpoints, printing results to stdout
-# so Claude sees them as session context.
+# breath-hook endpoint, printing results to stdout so Claude sees
+# them as session context. Wake-up surfaces only pinned buckets +
+# recent archived session summaries (2-5); dreaming and feel are
+# NOT triggered here — dream() / breath(domain="feel") are
+# explicit-only.
+# 唤醒只浮现 钉选桶 + 最近归档的会话总结（2-5条）；不触发 Dreaming、
+# 不带 feel——dream() 和 breath(domain="feel") 需要时单独调用。
 #
 # 为什么有这个钩子：MCP 工具在某些客户端（如 Claude Code 网页/远程）
 # 是“延迟加载”的，且服务器名可能是自动生成的 UUID——重配后工具 ID
@@ -13,9 +18,6 @@
 # /breath-hook，不依赖 MCP 工具发现，所以就算工具还没加载，睁眼也能
 # 先看到记忆。是名字漂移问题的“兜底”，不是根治（根治要在客户端钉死
 # 服务器名）。
-#
-# Sequence: breath → dream
-# 顺序：呼吸浮现 → 做梦消化
 #
 # Config:
 #   OMBRE_HOOK_URL   — override the server URL (default: http://localhost:8000)
@@ -69,15 +71,12 @@ def main():
     deadline = time.monotonic() + TOTAL_BUDGET_S
     base_urls = _candidate_urls()
 
-    # 先确定哪个 URL 能连通（breath），连通后用同一个 URL 继续 dream
+    # 唤醒只呼吸：/breath-hook 返回 钉选 + 最近归档（2-5条）。
+    # 不再调用 /dream-hook——dreaming 和 feel 不在唤醒时触发。
     base = _first_reachable(base_urls, "/breath-hook", retries, deadline)
     if base is None:
         # 全部不可达：安静退出，绝不阻塞会话启动
         sys.exit(0)
-
-    # breath 已经在探测时打印过结果；接着做梦消化
-    if time.monotonic() < deadline:
-        _call_endpoint(base, "/dream-hook", retries, deadline)
 
 
 def _first_reachable(base_urls, path, retries, deadline):

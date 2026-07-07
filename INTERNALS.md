@@ -59,8 +59,8 @@
 
 **模型感受/反思系统**
 - **Feel 写入**（`hold(feel=True)`）：存模型第一人称感受，标记源记忆为 digested
-- **Dream 做梦**（`dream()`）：返回最近 10 条 + 自省引导 + 连接提示 + 结晶化提示
-- **对话启动流程**：breath() → dream() → breath(domain="feel") → 开始对话
+- **Dream 做梦**（`dream()`）：返回最近 10 条 + 自省引导 + 连接提示 + 结晶化提示；只在显式调用时触发，唤醒不自动做梦
+- **对话启动流程**：breath()（钉选 + 最近归档 2-5 条，不触发 dream/feel）→ 开始对话
 
 **自动化处理**
 - 存入时 LLM 自动分析 domain/valence/arousal/tags/name
@@ -86,11 +86,10 @@
 **工具详细行为**
 
 **`breath`** — 五种模式：
-- **无 query 模式**：无参调用，不做语义浮现；只返回钉选桶（始终展示）+ 按 `archived_at` 降序排列的最近归档会话总结（默认 5 条）；普通动态桶（hold 写入的）不出现在这里，只作为语义搜索的检索库
+- **无 query 模式**：无参调用，不做语义浮现；只返回钉选桶（始终展示）+ 按 `archived_at` 降序排列的最近归档会话总结（2-5 条：上限 5，token 预算紧时保底 2）；不触发 Dreaming、不带 feel；普通动态桶（hold 写入的）不出现在这里，只作为语义搜索的检索库
 - **检索模式（语义浮现）**（有 query）：关键词 + 向量双通道搜索，四维评分（topic×4 + emotion×2 + time×2.5 + importance×1），阈值过滤
 - **Feel 检索**（`domain="feel"`）：特殊通道，按创建时间倒序返回所有 feel 类型桶，不走评分逻辑
-- **唤醒模式**（`wake=True`）：只返回钉选桶 + 最近归档桶（按 `archived_at` 降序，默认 5 条），忽略其它检索参数，不做语义浮现
-- **一站式启动**（`startup=True`）：一次调用打包 核心准则+最近归档 + Dreaming + 最近 3 条 feel，替代对话开头三连；优先级最高；不传 query，不做语义浮现
+- **唤醒模式**（`wake=True` 或 `startup=True`，二者等价）：只返回钉选桶 + 最近归档桶（按 `archived_at` 降序，2-5 条），忽略其它检索参数，不做语义浮现；不触发 Dreaming、不带 feel（startup 旧行为曾打包 Dreaming + 最近 feel，现已收敛为纯唤醒浮现）
 - **重要度批量模式**（`importance_min>=1`）：跳过语义搜索，直接筛选 importance≥importance_min 的桶，按 importance 降序，最多 20 条
 - 若指定 valence，对匹配桶的 valence 微调 ±0.1（情感记忆重构）
 
@@ -121,7 +120,7 @@
 |---|---|---|
 | `/health` | GET | 健康检查 |
 | `/breath-hook` | GET | SessionStart 钩子 |
-| `/dream-hook` | GET | Dream 钩子 |
+| `/dream-hook` | GET | Dream 钩子（端点保留；SessionStart 钩子不再自动调用，唤醒不做梦） |
 | `/dashboard` | GET | Dashboard 页面 |
 | `/api/buckets` | GET | 桶列表 🔒 |
 | `/api/bucket/{id}` | GET | 桶详情 🔒 |

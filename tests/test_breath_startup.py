@@ -1,11 +1,13 @@
 # ============================================================
-# breath startup=True 一站式启动模式测试
-# One-shot session bootstrap: surfacing + dreaming + recent feels.
+# breath startup=True 唤醒模式测试
+# Startup wake-up: only pinned + recent archived (2-5), no dreaming/feel.
 #
 # 验证:
-#   - 一次调用返回 浮现 + Dreaming + feel 三个板块
-#   - feel 只取最近3条
+#   - startup=True 只返回 钉选桶 + 最近归档桶（与 wake 统一）
+#   - 不触发 Dreaming 板块
+#   - 不带 feel 桶
 #   - 无任何记忆时不报错
+#   - startup 优先于 query 搜索
 # ============================================================
 
 import pytest
@@ -23,13 +25,49 @@ def patched_server(bucket_mgr, decay_eng, mock_dehydrator, mock_embedding_engine
 
 
 @pytest.mark.asyncio
-async def test_startup_bundles_all_sections(patched_server, bucket_mgr):
-    """startup=True 应同时包含 核心准则/浮现记忆、Dreaming、feel 三个板块。"""
+async def test_startup_returns_pinned_and_archived_only(patched_server, bucket_mgr):
+    """startup=True 只包含 钉选桶 + 归档桶，普通未解决桶不出现。"""
     pinned_id = await bucket_mgr.create(
         content="核心准则", name="准则", domain=["日常"], pinned=True,
     )
-    unresolved_id = await bucket_mgr.create(
+    archived_id = await bucket_mgr.create(
+        content="上个窗口的会话总结", name="会话总结", domain=["日常"], importance=5,
+    )
+    assert await bucket_mgr.archive(archived_id)
+    ordinary_id = await bucket_mgr.create(
         content="未解决的事", name="未解决", domain=["日常"], importance=8,
+    )
+
+    out = await patched_server.breath(startup=True)
+
+    assert pinned_id in out
+    assert archived_id in out
+    assert ordinary_id not in out, "ordinary dynamic bucket leaked into startup wake-up"
+    assert "核心准则" in out
+    assert "最近归档" in out
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_trigger_dreaming(patched_server, bucket_mgr):
+    """唤醒不触发 Dreaming：即使有未解决记忆，也不出现 Dreaming 板块。"""
+    await bucket_mgr.create(
+        content="未解决的事", name="未解决", domain=["日常"], importance=8,
+    )
+    pinned_id = await bucket_mgr.create(
+        content="核心准则", name="准则", domain=["日常"], pinned=True,
+    )
+
+    out = await patched_server.breath(startup=True)
+
+    assert pinned_id in out
+    assert "Dreaming" not in out, "startup wake-up must not trigger dreaming"
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_include_feels(patched_server, bucket_mgr):
+    """唤醒不带 feel：feel 桶只通过 breath(domain='feel') 显式读取。"""
+    pinned_id = await bucket_mgr.create(
+        content="核心准则", name="准则", domain=["日常"], pinned=True,
     )
     feel_id = await bucket_mgr.create(
         content="我的一点感受", name="feel1", bucket_type="feel",
@@ -37,37 +75,12 @@ async def test_startup_bundles_all_sections(patched_server, bucket_mgr):
 
     out = await patched_server.breath(startup=True)
 
-    assert "核心准则" in out
     assert pinned_id in out
-    assert unresolved_id in out
-    assert "Dreaming" in out
-    assert "feel" in out
-    assert feel_id in out
+    assert feel_id not in out, "feel bucket leaked into startup wake-up"
 
-
-@pytest.mark.asyncio
-async def test_startup_caps_feels_at_three(patched_server, bucket_mgr):
-    """feel 板块只带最近 3 条，旧的不带。"""
-    ids = []
-    for i in range(5):
-        bid = await bucket_mgr.create(
-            content=f"感受{i}", name=f"feel{i}", bucket_type="feel",
-        )
-        ids.append(bid)
-        # 用 created 时间区分先后
-        import frontmatter as fm
-        fpath = bucket_mgr._find_bucket_file(bid)
-        post = fm.load(fpath)
-        post["created"] = f"2024-01-{i + 1:02d}T00:00:00"
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(fm.dumps(post))
-
-    out = await patched_server.breath(startup=True)
-
-    shown = [bid for bid in ids if bid in out]
-    assert len(shown) == 3, f"expected 3 recent feels, got {len(shown)}"
-    assert ids[-1] in out  # newest present
-    assert ids[0] not in out  # oldest trimmed
+    # feel 仍可通过显式通道读取
+    feel_out = await patched_server.breath(query="x", domain="feel")
+    assert feel_id in feel_out
 
 
 @pytest.mark.asyncio
@@ -80,7 +93,9 @@ async def test_startup_empty_store_does_not_crash(patched_server, bucket_mgr):
 @pytest.mark.asyncio
 async def test_startup_takes_priority_over_search(patched_server, bucket_mgr):
     """startup=True 时忽略 query，不走搜索分支。"""
-    await bucket_mgr.create(content="苹果记忆", name="苹果", domain=["日常"], importance=8)
+    ordinary_id = await bucket_mgr.create(
+        content="苹果记忆", name="苹果", domain=["日常"], importance=8,
+    )
     out = await patched_server.breath(query="苹果", startup=True)
-    # 搜索分支的输出没有 Dreaming 板块；startup 有
-    assert "Dreaming" in out
+    # 搜索分支会命中普通桶；唤醒模式不会
+    assert ordinary_id not in out

@@ -122,6 +122,23 @@ async def test_wake_respects_explicit_max_results(patched_server, bucket_mgr):
 
 
 @pytest.mark.asyncio
+async def test_wake_keeps_min_two_archived_under_tight_budget(patched_server, bucket_mgr):
+    """token 预算极紧时仍保底 2 条最近归档（2-5 条区间的下限）。"""
+    ids = []
+    for i in range(4):
+        bid = await bucket_mgr.create(
+            content=f"归档内容{i}" * 50, name=f"归档{i}", domain=["日常"], importance=5,
+        )
+        assert await bucket_mgr.archive(bid)
+        ids.append(bid)
+
+    out = await patched_server.breath(wake=True, max_tokens=1)
+
+    shown = [bid for bid in ids if bid in out]
+    assert len(shown) >= 2, f"expected min 2 archived under tight budget, got {len(shown)}"
+
+
+@pytest.mark.asyncio
 async def test_wake_empty_state(patched_server, bucket_mgr):
     """没有钉选也没有归档时给出明确的空态提示。"""
     await bucket_mgr.create(content="普通记忆", name="普通", domain=["日常"], importance=5)
