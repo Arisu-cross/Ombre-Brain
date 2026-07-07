@@ -56,7 +56,7 @@ breath(query="", max_tokens=-1, domain="", valence=-1, arousal=-1, max_results=-
 6. 按 `archived_at`（缺失时回退 `last_active`/`created`）**降序**排列
 7. 截断到生效条数：`max_results=-1`（默认）→ 取最近 5 条；显式传 `>=1` 则硬截断为该值（最大 50）
 8. 对每个桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要（`mode=summary` 时用单行摘要）
-9. 按 `max_tokens` 预算截断输出
+9. 按 `max_tokens` 预算截断输出；默认（自适应）模式下归档条目**保底 2 条**——即钉选桶吃掉预算也至少浮现最近 2 条归档（最终 2-5 条区间）
 
 **返回结果**：
 - 无钉选且无归档时：`"没有钉选记忆，也没有归档的会话总结。"`
@@ -74,11 +74,10 @@ breath(query="", max_tokens=-1, domain="", valence=-1, arousal=-1, max_results=-
 
 **Claude 行为（完整对话启动序列，来自 CLAUDE_PROMPT.md）**：
 ```
-1. breath()               — 钉选桶 + 最近归档的会话总结（不做语义浮现）
-2. dream()                — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel")  — 读取之前的 feel
-4. 开始和用户说话
+1. breath()               — 钉选桶 + 最近归档的会话总结（2-5条，不做语义浮现）
+2. 开始和用户说话
 ```
+唤醒**不触发** `dream()`、**不带** feel——`dream()` 和 `breath(domain="feel")` 只在需要时显式调用。
 
 **`breath(domain="feel")` 内部流程**：
 1. 检测到 `domain.strip().lower() == "feel"` → 进入 feel 专用通道
@@ -437,13 +436,13 @@ breath(wake=True)
 
 **系统内部发生什么**：
 
-1. `wake=True` → 进入**唤醒模式**，优先级高于 `importance_min`/`query`/`domain` 等其它检索参数，全部忽略
+1. `wake=True`（或 `startup=True`）→ 进入**唤醒模式**，优先级高于 `importance_min`/`query`/`domain` 等其它检索参数，全部忽略
 2. `bucket_mgr.list_all(include_archive=True)` 全量加载（含归档目录）
 3. 筛选钉选桶（`pinned=True` 或 `protected=True`）— 作为核心准则，始终展示
 4. 筛选 `type == "archived"` 的归档桶，按 `archived_at`（真实归档时刻，`archive()` 时写入；存量老桶无此字段时回退 `last_active`/`created`）降序排列
-5. 截断归档桶条数：`max_results` 未显式传时默认取 **5** 条（3-5 条区间上限）；显式传 `>=1` 则按该值截断
-6. 对每条调用 `dehydrator.dehydrate()`（或 `mode=summary` 时用单行摘要）压缩，按 `max_tokens` 预算截断
-7. 未解决桶（普通权重池）**不参与**唤醒模式，不会出现在结果里
+5. 截断归档桶条数：`max_results` 未显式传时默认取 **5** 条（2-5 条区间上限）；显式传 `>=1` 则按该值截断
+6. 对每条调用 `dehydrator.dehydrate()`（或 `mode=summary` 时用单行摘要）压缩，按 `max_tokens` 预算截断；自适应模式下归档条目**保底 2 条**（2-5 条区间下限）
+7. 未解决桶（普通权重池）**不参与**唤醒模式；Dreaming **不触发**，feel 桶**不出现**——两者只在显式调用（`dream()` / `breath(domain="feel")`）时出现
 
 **返回结果**：
 - 都为空时：`"唤醒模式：没有钉选记忆，也没有最近归档的记忆。"`
@@ -453,7 +452,7 @@ breath(wake=True)
 
 ---
 
-### 场景 14：对话开头一站式启动（startup）
+### 场景 14：对话开头启动（startup）
 
 **Claude 行为**：
 ```python
@@ -462,14 +461,11 @@ breath(startup=True)
 
 **系统内部发生什么**：
 
-1. `startup=True` → 进入**一站式启动模式**，优先级高于 `wake` 及其它检索参数
-2. 内部依次组装三个板块，任一板块失败只跳过该板块，不影响其余：
-   - **核心准则 + 最近归档**：复用无参 `breath()` 的无 query 分支（钉选桶 + 按归档时间降序的最近会话总结，不做语义浮现），子预算为 `max_tokens - 4000`（下限 3000）
-   - **Dreaming**：复用 `dream()`（最近 5 桶摘要 + 自省引导 + 关联提示）
-   - **最近 feel**：按 `created` 降序取最近 **3** 条 feel 全文（不像 `domain="feel"` 那样翻全部）
-3. 三板块全部失败时返回 `"记忆系统暂时无法访问。"`
+1. `startup=True` → 与 `wake=True` 走**同一条唤醒分支**（见场景 13）：只返回 钉选桶（核心准则）+ 最近归档桶（2-5 条，按归档时间降序）
+2. **不触发 Dreaming、不带 feel**——`dream()` 和 `breath(domain="feel")` 只在需要时显式调用
+3. 列桶失败时返回 `"记忆系统暂时无法访问。"`；无钉选且无归档时返回唤醒空态提示
 
-**目的**：一次工具调用替代旧的 `breath()` → `dream()` → `breath(domain="feel")` 三连，省 token 也省往返。
+**历史**：startup 旧行为曾一次打包 核心准则+最近归档 + Dreaming + 最近 3 条 feel（替代三连调用）；现已收敛为纯唤醒浮现——唤醒只看钉选和最近归档，做梦与翻旧感受改为显式动作。参数保留是为了向后兼容。
 
 ---
 

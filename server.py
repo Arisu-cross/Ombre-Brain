@@ -341,7 +341,8 @@ async def health_check(request):
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
-        HOOK_ARCHIVE_DEFAULT = 5  # 默认取最近 3-5 条归档的会话总结
+        HOOK_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
+        HOOK_ARCHIVE_MIN = 2      # 归档条数下限：保底 2 条（2-5 条区间）
         all_buckets = await bucket_mgr.list_all(include_archive=True)
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
@@ -354,7 +355,7 @@ async def breath_hook(request):
         token_budget = 10000
         for r in parts:
             token_budget -= count_tokens_approx(r)
-        parts += await _render_archived(archived, "full", token_budget)
+        parts += await _render_archived(archived, "full", token_budget, min_keep=HOOK_ARCHIVE_MIN)
 
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
@@ -542,17 +543,23 @@ async def _render_pinned(pinned_buckets: list, mode: str) -> list:
     return results
 
 
-async def _render_archived(archived_buckets: list, mode: str, token_budget: int) -> list:
-    """归档桶 → 最近归档条目，受 token 预算约束。"""
+async def _render_archived(
+    archived_buckets: list, mode: str, token_budget: int, min_keep: int = 0
+) -> list:
+    """归档桶 → 最近归档条目，受 token 预算约束。
+
+    min_keep: 保底条数——token 预算耗尽也至少渲染这么多条（有货的前提下），
+    保证唤醒时"最近归档 2-5 条"的下限不被钉选桶挤掉。
+    """
     results = []
     for b in archived_buckets:
-        if token_budget <= 0:
+        if token_budget <= 0 and len(results) >= min_keep:
             break
         try:
             if mode == "summary":
                 line = _summary_line(b, prefix="🗄️ [归档] ")
                 line_tokens = count_tokens_approx(line)
-                if line_tokens > token_budget:
+                if line_tokens > token_budget and len(results) >= min_keep:
                     break
                 results.append(line)
                 token_budget -= line_tokens
@@ -560,7 +567,7 @@ async def _render_archived(archived_buckets: list, mode: str, token_budget: int)
             clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
             summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
+            if summary_tokens > token_budget and len(results) >= min_keep:
                 break
             results.append(f"🗄️ [归档] [bucket_id:{b['id']}] {summary}")
             token_budget -= summary_tokens
@@ -656,11 +663,14 @@ def _extract_todos(bucket: dict) -> list[str]:
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
 #
-# No args: pinned buckets + recent archived session summaries (no semantic surfacing)
-# 无参数：钉选桶 + 最近归档的会话总结（按归档时间降序，不做语义浮现）
+# No args: pinned buckets + recent archived session summaries (2-5, no semantic surfacing)
+# 无参数：钉选桶 + 最近归档的会话总结（按归档时间降序取 2-5 条，不做语义浮现）
 # Ordinary dynamic buckets (written by hold) never appear here — they are
 # only reachable through query-based semantic search.
 # 普通动态桶（hold 写入的）不出现在无 query 的默认返回里，只作为语义搜索的检索库。
+# Wake-up (no query / wake / startup) never triggers Dreaming and never
+# includes feel buckets — dream() and breath(domain="feel") are explicit-only.
+# 唤醒（无 query / wake / startup）不触发 Dreaming、不带 feel——两者只在显式调用时出现。
 # With args: semantic surfacing — search by keyword + emotion coordinates
 # 有参数：语义浮现——按关键词+情感坐标检索记忆
 # =============================================================
@@ -680,7 +690,7 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=只返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认最近5条;普通动态桶不出现,只在有query的语义搜索中被检索);有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake时最近归档取5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认3-5条,可用max_results显式调整条数)。startup=True时一站式启动:一次调用打包返回 核心准则+最近归档+Dreaming最近记忆+最近3条feel,替代对话开头的 breath→dream→breath(feel) 三连,忽略其它检索参数(不做语义浮现);startup优先于wake。"""
+    """检索/浮现记忆。不传query或传空=只返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条;普通动态桶不出现,只在有query的语义搜索中被检索;不触发Dreaming,不带feel);有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数);唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -704,56 +714,13 @@ async def breath(
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
 
-    # --- startup mode: one-shot session bootstrap ---
-    # --- startup 一站式启动：浮现 + Dreaming + 最近 feel，一次调用替代三连 ---
-    if startup:
-        STARTUP_FEEL_COUNT = 3
-        sections = []
-
-        # 1) 浮现（核心准则 + 最近归档的会话总结）——复用无参 breath 的浮现分支
-        try:
-            surf = await breath(mode=mode, max_tokens=max(3000, max_tokens - 4000))
-            if surf:
-                sections.append(surf)
-        except Exception as e:
-            logger.warning(f"Startup surfacing failed / 启动浮现失败: {e}")
-
-        # 2) Dreaming——最近记忆 + 自省引导（默认摘要，本就便宜）
-        try:
-            dr = await dream()
-            if dr and "无法访问" not in dr:
-                sections.append(dr)
-        except Exception as e:
-            logger.warning(f"Startup dream failed / 启动dream失败: {e}")
-
-        # 3) 最近 feel——只取最近3条，不像 domain="feel" 那样翻全部
-        try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: str(b["metadata"].get("created", "")), reverse=True)
-            feels = feels[:STARTUP_FEEL_COUNT]
-            if feels:
-                entries = [
-                    f"[{f['metadata'].get('created', '')}] [bucket_id:{f['id']}]\n"
-                    f"{strip_wikilinks(f['content'])}"
-                    for f in feels
-                ]
-                sections.append(
-                    f"=== 你留下的 feel（最近{len(feels)}条）===\n" + "\n---\n".join(entries)
-                )
-        except Exception as e:
-            logger.warning(f"Startup feel retrieval failed / 启动feel读取失败: {e}")
-
-        if not sections:
-            return "记忆系统暂时无法访问。"
-        final_text = "\n\n".join(sections)
-        await _fire_webhook("breath", {"mode": "startup", "sections": len(sections), "chars": len(final_text)})
-        return final_text
-
-    # --- wake mode: triggered surface — only pinned + recent archived ---
-    # --- wake 唤醒模式：触发式浮现——只返回钉选桶 + 最近归档桶 ---
-    if wake:
-        WAKE_ARCHIVE_DEFAULT = 5  # 默认取 3-5 条最近归档
+    # --- startup / wake mode: triggered surface — only pinned + recent archived ---
+    # --- startup / wake 唤醒模式：触发式浮现——只返回钉选桶 + 最近归档桶（2-5条）---
+    # 唤醒时不触发 Dreaming、不带 feel：dream/feel 只在被显式调用时才出现。
+    # （startup 旧行为曾打包 Dreaming + 最近 feel，现与 wake 统一为纯唤醒浮现。）
+    if startup or wake:
+        WAKE_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
+        WAKE_ARCHIVE_MIN = 2      # 归档条数下限：token 预算再紧也保底 2 条
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=True)
         except Exception as e:
@@ -776,7 +743,10 @@ async def breath(
         token_budget = max_tokens
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
-        archive_results = await _render_archived(archived_buckets, mode, token_budget)
+        min_keep = WAKE_ARCHIVE_MIN if auto_results else 0
+        archive_results = await _render_archived(
+            archived_buckets, mode, token_budget, min_keep=min_keep
+        )
 
         if not pinned_results and not archive_results:
             await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
@@ -789,7 +759,11 @@ async def breath(
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         await _fire_webhook(
             "breath",
-            {"mode": "wake", "pinned": len(pinned_results), "archived": len(archive_results)},
+            {
+                "mode": "startup" if startup else "wake",
+                "pinned": len(pinned_results),
+                "archived": len(archive_results),
+            },
         )
         return "\n\n".join(parts)
 
@@ -835,7 +809,8 @@ async def breath(
     # 普通动态桶（hold 写入的）不出现在这里，只作为语义搜索（query 非空）的检索库；
     # 语义浮现（权重排序/冷启动/多样性采样）见下方 "With args: search mode" 分支。
     if not query or not query.strip():
-        BREATH_ARCHIVE_DEFAULT = 5  # 默认取最近 3-5 条归档的会话总结
+        BREATH_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
+        BREATH_ARCHIVE_MIN = 2      # 归档条数下限：保底 2 条（2-5 条区间）
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=True)
         except Exception as e:
@@ -870,7 +845,10 @@ async def breath(
         token_budget = max_tokens
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
-        archive_results = await _render_archived(archived_buckets, mode, token_budget)
+        archive_results = await _render_archived(
+            archived_buckets, mode, token_budget,
+            min_keep=BREATH_ARCHIVE_MIN if auto_results else 0,
+        )
 
         if not pinned_results and not archive_results:
             return "没有钉选记忆，也没有归档的会话总结。"

@@ -316,12 +316,12 @@ breath(query="今天很累")
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=只返回钉选桶+最近归档的会话总结(按归档时间降序,不做语义浮现,普通动态桶只在搜索时出现)；有参数=关键词+向量语义双通道检索(语义浮现)。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = pinned buckets + recent archived session summaries only (by archive time desc, no semantic surfacing; ordinary dynamic buckets only appear in search); with query = keyword + vector dual-channel search (semantic surfacing). Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。无参数=只返回钉选桶+最近归档的会话总结(按归档时间降序取 2-5 条,不触发 dreaming、不带 feel,不做语义浮现,普通动态桶只在搜索时出现)；有参数=关键词+向量语义双通道检索(语义浮现)。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = pinned buckets + recent archived session summaries only (2-5, by archive time desc; no dreaming, no feels, no semantic surfacing; ordinary dynamic buckets only appear in search); with query = keyword + vector dual-channel search (semantic surfacing). Supports domain/valence/arousal filters |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
-| `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
+| `dream` | 显式调用的自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve；唤醒不自动触发 / Explicit self-reflection — not auto-triggered on wake-up |
 
 ## 安装 / Setup
 
@@ -523,9 +523,9 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 ## Dreaming 与 Feel / Dreaming & Feel
 
 ### Dreaming — 做梦
-每次新对话开始时，Claude 会自动执行 `dream()`——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
+`dream()` 只在 Claude 想自省消化时显式调用（唤醒不会自动触发）——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
 
-At the start of each conversation, Claude runs `dream()` — reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
+`dream()` is invoked explicitly when Claude wants to reflect (it is NOT auto-triggered on wake-up) — it reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
 
 - 值得放下的 → `trace(resolved=1)` 让它沉底
 - 有沉淀的 → 写 `feel`，记录模型自己的感受
@@ -544,11 +544,11 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
-1. breath()              — 睁眼，看有什么浮上来
-2. dream()               — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel") — 读之前的 feel
-4. 开始和用户说话
+1. breath()  — 唤醒：只浮现 钉选（核心准则）+ 最近归档的会话总结（2-5条）
+2. 开始和用户说话
 ```
+唤醒不触发 dreaming、不带 feel——`dream()` 和 `breath(domain="feel")` 需要时单独调用。
+Wake-up never triggers dreaming and never includes feels — call `dream()` / `breath(domain="feel")` explicitly when needed.
 
 ## 给 Claude 的使用指南 / Usage Guide for Claude
 
