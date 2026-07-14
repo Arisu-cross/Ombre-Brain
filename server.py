@@ -78,6 +78,8 @@ except ValueError:
 # 详见 ENV_VARS.md。
 OMBRE_HOOK_URL = os.environ.get("OMBRE_HOOK_URL", "").strip()
 OMBRE_HOOK_SKIP = os.environ.get("OMBRE_HOOK_SKIP", "").strip().lower() in ("1", "true", "yes", "on")
+# 无参 breath / 唤醒 / breath-hook 里"最近记下"(hold 写入的动态桶)浮现条数,0 = 关闭
+BREATH_RECENT_N = int(os.environ.get("BREATH_RECENT_N", "3") or "3")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -334,8 +336,8 @@ async def health_check(request):
 # 会话启动专用挂载点
 #
 # Same selection as the no-query breath: pinned buckets + recent
-# archived session summaries. Ordinary dynamic buckets never appear.
-# 与无 query breath 一致：钉选桶 + 最近归档的会话总结，普通动态桶不出现。
+# archived session summaries + recent hold-written dynamic buckets.
+# 与无 query breath 一致：钉选桶 + 最近归档的会话总结 + 最近记下的动态桶。
 # =============================================================
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
@@ -356,6 +358,12 @@ async def breath_hook(request):
         for r in parts:
             token_budget -= count_tokens_approx(r)
         parts += await _render_archived(archived, "full", token_budget, min_keep=HOOK_ARCHIVE_MIN)
+        # 最近记下的动态桶:单行摘要即可(线索行,细节让他自己 breath 查),不烧脱水 API
+        token_budget = 10000 - sum(count_tokens_approx(x) for x in parts)
+        parts += await _render_archived(
+            _recent_dynamic(all_buckets, BREATH_RECENT_N), "summary", token_budget,
+            min_keep=1, prefix="📝 [最近记下] ",
+        )
 
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
@@ -544,12 +552,14 @@ async def _render_pinned(pinned_buckets: list, mode: str) -> list:
 
 
 async def _render_archived(
-    archived_buckets: list, mode: str, token_budget: int, min_keep: int = 0
+    archived_buckets: list, mode: str, token_budget: int, min_keep: int = 0,
+    prefix: str = "🗄️ [归档] ",
 ) -> list:
     """归档桶 → 最近归档条目，受 token 预算约束。
 
     min_keep: 保底条数——token 预算耗尽也至少渲染这么多条（有货的前提下），
     保证唤醒时"最近归档 2-5 条"的下限不被钉选桶挤掉。
+    prefix: 条目前缀，"最近记下"段复用本函数时换成 📝。
     """
     results = []
     for b in archived_buckets:
@@ -557,7 +567,7 @@ async def _render_archived(
             break
         try:
             if mode == "summary":
-                line = _summary_line(b, prefix="🗄️ [归档] ")
+                line = _summary_line(b, prefix=prefix)
                 line_tokens = count_tokens_approx(line)
                 if line_tokens > token_budget and len(results) >= min_keep:
                     break
@@ -569,12 +579,35 @@ async def _render_archived(
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget and len(results) >= min_keep:
                 break
-            results.append(f"🗄️ [归档] [bucket_id:{b['id']}] {summary}")
+            results.append(f"{prefix}[bucket_id:{b['id']}] {summary}")
             token_budget -= summary_tokens
         except Exception as e:
             logger.warning(f"Failed to dehydrate archived bucket / 归档桶脱水失败: {e}")
             continue
     return results
+
+
+def _recent_dynamic(all_buckets: list, limit: int) -> list:
+    """hold 写入的普通动态桶，按 last_active（回退 created）降序取最近几条。
+
+    修复「他自己 hold 过的内容 breath 时被忽略」：之前无参 breath/唤醒只回
+    钉选+归档，动态桶只能靠语义搜索命中——刚记下的事在新窗口里等于不存在。
+    钉选/归档/feel/休眠桶不算，它们各有自己的浮现通道。limit<=0 时关闭。
+    """
+    if limit <= 0:
+        return []
+    dyn = [
+        b for b in all_buckets
+        if b["metadata"].get("type") == "dynamic"
+        and not b["metadata"].get("pinned")
+        and not b["metadata"].get("protected")
+        and not b["metadata"].get("dormant")
+    ]
+    dyn.sort(
+        key=lambda b: str(b["metadata"].get("last_active", b["metadata"].get("created", ""))),
+        reverse=True,
+    )
+    return dyn[:limit]
 
 
 async def _related_note(bucket: dict) -> str:
@@ -665,9 +698,11 @@ def _extract_todos(bucket: dict) -> list[str]:
 #
 # No args: pinned buckets + recent archived session summaries (2-5, no semantic surfacing)
 # 无参数：钉选桶 + 最近归档的会话总结（按归档时间降序取 2-5 条，不做语义浮现）
-# Ordinary dynamic buckets (written by hold) never appear here — they are
-# only reachable through query-based semantic search.
-# 普通动态桶（hold 写入的）不出现在无 query 的默认返回里，只作为语义搜索的检索库。
+# Plus the most recent hold-written dynamic buckets (BREATH_RECENT_N, default 3):
+# without them, freshly held memories were invisible in a new window unless a
+# semantic query happened to hit them.
+# 另附最近 hold 写入的动态桶（BREATH_RECENT_N 条，默认 3，设 0 关闭）：
+# 不带的话，刚记下的事在新窗口里除非语义搜索碰巧命中，否则等于不存在。
 # Wake-up (no query / wake / startup) never triggers Dreaming and never
 # includes feel buckets — dream() and breath(domain="feel") are explicit-only.
 # 唤醒（无 query / wake / startup）不触发 Dreaming、不带 feel——两者只在显式调用时出现。
@@ -690,7 +725,7 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=只返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条;普通动态桶不出现,只在有query的语义搜索中被检索;不触发Dreaming,不带feel);有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,只返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数);唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
+    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -748,7 +783,15 @@ async def breath(
             archived_buckets, mode, token_budget, min_keep=min_keep
         )
 
-        if not pinned_results and not archive_results:
+        # 最近记下:他自己 hold 的动态桶也要浮上来(保底 1 条,预算兜底)
+        for r in archive_results:
+            token_budget -= count_tokens_approx(r)
+        recent_results = await _render_archived(
+            _recent_dynamic(all_buckets, BREATH_RECENT_N), mode, token_budget,
+            min_keep=1 if auto_results else 0, prefix="📝 [最近记下] ",
+        )
+
+        if not pinned_results and not archive_results and not recent_results:
             await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
             return "唤醒模式：没有钉选记忆，也没有最近归档的记忆。"
 
@@ -757,12 +800,15 @@ async def breath(
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if archive_results:
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
+        if recent_results:
+            parts.append("=== 最近记下 ===\n" + "\n---\n".join(recent_results))
         await _fire_webhook(
             "breath",
             {
                 "mode": "startup" if startup else "wake",
                 "pinned": len(pinned_results),
                 "archived": len(archive_results),
+                "recent": len(recent_results),
             },
         )
         return "\n\n".join(parts)
@@ -850,7 +896,19 @@ async def breath(
             min_keep=BREATH_ARCHIVE_MIN if auto_results else 0,
         )
 
-        if not pinned_results and not archive_results:
+        # 最近记下:他自己 hold 的动态桶也要浮上来(保底 1 条,预算兜底)
+        for r in archive_results:
+            token_budget -= count_tokens_approx(r)
+        recent_buckets = [
+            b for b in _recent_dynamic(all_buckets, BREATH_RECENT_N)
+            if _passes_date_filter(b["metadata"], date_from, date_to)
+        ]
+        recent_results = await _render_archived(
+            recent_buckets, mode, token_budget,
+            min_keep=1 if auto_results else 0, prefix="📝 [最近记下] ",
+        )
+
+        if not pinned_results and not archive_results and not recent_results:
             return "没有钉选记忆，也没有归档的会话总结。"
 
         parts = []
@@ -858,6 +916,8 @@ async def breath(
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if archive_results:
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
+        if recent_results:
+            parts.append("=== 最近记下 ===\n" + "\n---\n".join(recent_results))
         return "\n\n".join(parts)
 
     # --- Feel retrieval: domain="feel" is a special channel ---

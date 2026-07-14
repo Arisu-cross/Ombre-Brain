@@ -1,12 +1,12 @@
 # ============================================================
 # breath wake=True 唤醒模式测试
-# Triggered-wake mode: only pinned + recent archived buckets.
+# Triggered-wake mode: pinned + recent archived + recent held buckets.
 #
 # 验证:
-#   - wake=True 只返回钉选桶 + 最近归档桶,普通未解决桶不出现
+#   - wake=True 返回钉选桶 + 最近归档桶 + 最近记下的动态桶
 #   - 归档桶按 archived_at(回退 last_active)降序,默认最多 5 条
 #   - archive() 会写入 archived_at,排序优先于 last_active
-#   - 无钉选/无归档时给出空态提示
+#   - 空库时给出空态提示
 # ============================================================
 
 import frontmatter as fm
@@ -35,8 +35,8 @@ def patched_server(bucket_mgr, decay_eng, mock_dehydrator, mock_embedding_engine
 
 
 @pytest.mark.asyncio
-async def test_wake_returns_pinned_and_archived_only(patched_server, bucket_mgr):
-    """wake=True 应只包含钉选桶 + 归档桶，普通未解决桶不应出现。"""
+async def test_wake_returns_pinned_archived_and_recent(patched_server, bucket_mgr):
+    """wake=True 应包含钉选桶 + 归档桶 + 最近记下的动态桶。"""
     pinned_id = await bucket_mgr.create(
         content="核心准则内容", name="核心准则", domain=["日常"], pinned=True,
     )
@@ -52,9 +52,10 @@ async def test_wake_returns_pinned_and_archived_only(patched_server, bucket_mgr)
 
     assert pinned_id in out
     assert archived_id in out
-    assert ordinary_id not in out
+    assert ordinary_id in out, "recently held dynamic bucket should surface in 最近记下"
     assert "核心准则" in out
     assert "最近归档" in out
+    assert "最近记下" in out
 
 
 @pytest.mark.asyncio
@@ -140,7 +141,6 @@ async def test_wake_keeps_min_two_archived_under_tight_budget(patched_server, bu
 
 @pytest.mark.asyncio
 async def test_wake_empty_state(patched_server, bucket_mgr):
-    """没有钉选也没有归档时给出明确的空态提示。"""
-    await bucket_mgr.create(content="普通记忆", name="普通", domain=["日常"], importance=5)
+    """空库时给出明确的空态提示。"""
     out = await patched_server.breath(wake=True)
     assert "没有" in out
