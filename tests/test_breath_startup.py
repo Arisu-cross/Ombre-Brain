@@ -1,9 +1,9 @@
 # ============================================================
 # breath startup=True 唤醒模式测试
-# Startup wake-up: only pinned + recent archived (2-5), no dreaming/feel.
+# Startup wake-up: pinned + recent archived (2-5) + recent held, no dreaming/feel.
 #
 # 验证:
-#   - startup=True 只返回 钉选桶 + 最近归档桶（与 wake 统一）
+#   - startup=True 返回 钉选桶 + 最近归档桶 + 最近记下的动态桶（与 wake 统一）
 #   - 不触发 Dreaming 板块
 #   - 不带 feel 桶
 #   - 无任何记忆时不报错
@@ -25,8 +25,8 @@ def patched_server(bucket_mgr, decay_eng, mock_dehydrator, mock_embedding_engine
 
 
 @pytest.mark.asyncio
-async def test_startup_returns_pinned_and_archived_only(patched_server, bucket_mgr):
-    """startup=True 只包含 钉选桶 + 归档桶，普通未解决桶不出现。"""
+async def test_startup_returns_pinned_archived_and_recent(patched_server, bucket_mgr):
+    """startup=True 包含 钉选桶 + 归档桶 + 最近记下的动态桶。"""
     pinned_id = await bucket_mgr.create(
         content="核心准则", name="准则", domain=["日常"], pinned=True,
     )
@@ -42,9 +42,10 @@ async def test_startup_returns_pinned_and_archived_only(patched_server, bucket_m
 
     assert pinned_id in out
     assert archived_id in out
-    assert ordinary_id not in out, "ordinary dynamic bucket leaked into startup wake-up"
+    assert ordinary_id in out, "recently held dynamic bucket should surface in 最近记下"
     assert "核心准则" in out
     assert "最近归档" in out
+    assert "最近记下" in out
 
 
 @pytest.mark.asyncio
@@ -97,5 +98,7 @@ async def test_startup_takes_priority_over_search(patched_server, bucket_mgr):
         content="苹果记忆", name="苹果", domain=["日常"], importance=8,
     )
     out = await patched_server.breath(query="苹果", startup=True)
-    # 搜索分支会命中普通桶；唤醒模式不会
-    assert ordinary_id not in out
+    # 走的是唤醒浮现(分板块输出),不是搜索分支;桶经由「最近记下」出现
+    assert "===" in out, "startup should take the wake branch, not search"
+    assert "最近记下" in out
+    assert ordinary_id in out
