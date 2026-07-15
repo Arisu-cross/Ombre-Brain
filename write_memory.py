@@ -12,6 +12,8 @@ import uuid
 import argparse
 from datetime import datetime
 
+from utils import now_local
+
 
 def _resolve_dynamic_dir() -> str:
     """
@@ -50,7 +52,7 @@ def write_memory(
     arousal: float = 0.3,
 ):
     mid = gen_id()
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    now = now_local().strftime("%Y-%m-%dT%H:%M:%S")
 
     # YAML frontmatter
     domain_yaml = "\n".join(f"- {d}" for d in domain)

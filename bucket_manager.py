@@ -37,7 +37,7 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, now_local
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -766,7 +766,7 @@ class BucketManager:
         last_active_str = meta.get("last_active", meta.get("created", ""))
         try:
             last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
+            days = max(0.0, (now_local() - last_active).total_seconds() / 86400)
         except (ValueError, TypeError):
             days = 30
         return math.exp(-0.02 * days)
