@@ -24,6 +24,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from utils import now_local
+
 logger = logging.getLogger("ombre_brain.decay")
 
 
@@ -118,7 +120,7 @@ class DecayEngine:
         last_active_str = metadata.get("last_active", metadata.get("created", ""))
         try:
             last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
+            days_since = max(0.0, (now_local() - last_active).total_seconds() / 86400)
         except (ValueError, TypeError):
             days_since = 30
 
@@ -213,7 +215,7 @@ class DecayEngine:
             last_active_str = meta.get("last_active", meta.get("created", ""))
             try:
                 _la = datetime.fromisoformat(str(last_active_str))
-                days_idle = (datetime.now() - _la).total_seconds() / 86400
+                days_idle = (now_local() - _la).total_seconds() / 86400
             except (ValueError, TypeError):
                 days_idle = 999
             if meta.get("dormant"):
@@ -238,7 +240,7 @@ class DecayEngine:
                 last_active_str = meta.get("last_active", meta.get("created", ""))
                 try:
                     last_active = datetime.fromisoformat(str(last_active_str))
-                    days_since = (datetime.now() - last_active).total_seconds() / 86400
+                    days_since = (now_local() - last_active).total_seconds() / 86400
                 except (ValueError, TypeError):
                     days_since = 999
                 if imp <= 4 and days_since > 30:

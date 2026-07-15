@@ -15,7 +15,7 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 
 def load_config(config_path: str = None) -> dict:
@@ -238,9 +238,24 @@ def count_tokens_approx(text: str) -> int:
     return int(chinese_chars * 1.5 + english_words * 1.3 + len(text) * 0.05)
 
 
+# Memory timestamps live in the USER's timezone, not the container's.
+# 记忆时间戳按「人的时区」走,不跟容器走:容器多半是 UTC,直接 datetime.now()
+# 会让所有时间戳慢 8 小时——后半夜(北京 0-8 点)的记忆全被记成前一天。
+# 固定偏移实现,不依赖系统 tzdata;OMBRE_UTC_OFFSET 可调(默认 +8 北京时间)。
+_UTC_OFFSET_HOURS = float(os.environ.get("OMBRE_UTC_OFFSET", "8"))
+
+
+def now_local() -> datetime:
+    """
+    Current time in the configured user timezone (naive datetime).
+    返回配置时区下的当前时间(naive,与既有存量时间戳格式兼容)。
+    """
+    return (datetime.now(timezone.utc) + timedelta(hours=_UTC_OFFSET_HOURS)).replace(tzinfo=None)
+
+
 def now_iso() -> str:
     """
     Return current time as ISO format string.
-    返回当前时间的 ISO 格式字符串。
+    返回当前时间的 ISO 格式字符串(配置时区,默认北京时间)。
     """
-    return datetime.now().isoformat(timespec="seconds")
+    return now_local().isoformat(timespec="seconds")

@@ -36,6 +36,8 @@ import logging
 import subprocess
 from datetime import datetime, timedelta
 
+from utils import now_local
+
 logger = logging.getLogger("ombre_brain.backup")
 
 
@@ -138,7 +140,7 @@ class BackupEngine:
                 "content": b.get("content", ""),
             })
 
-        now = datetime.now()
+        now = now_local()
         return {
             "schema": "ombre-brain-backup/v1",
             "exported_at": now.isoformat(),
@@ -322,7 +324,7 @@ class BackupEngine:
     # 后台调度器（每天 HH:MM）
     # ---------------------------------------------------------
     def _seconds_until_next_run(self) -> float:
-        now = datetime.now()
+        now = now_local()
         target = now.replace(
             hour=self.run_hour, minute=self.run_minute, second=0, microsecond=0
         )
