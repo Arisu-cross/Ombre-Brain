@@ -111,10 +111,16 @@ backup_engine = BackupEngine(config, bucket_mgr)     # Daily backup engine / 每
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
+# stateless_http + json_response(默认开,OMBRE_STATELESS=0 关闭):
+# 每次调用独立请求、无会话可失效——服务器重启后,常驻客户端(claude -p)手里的
+# 旧连接不再变成死连接,不用重启对话进程就能继续用记忆工具。
+_STATELESS = os.environ.get("OMBRE_STATELESS", "1").strip().lower() not in ("0", "false", "no", "off")
 mcp = FastMCP(
     "Ombre Brain",
     host="0.0.0.0",
     port=OMBRE_PORT,
+    stateless_http=_STATELESS,
+    json_response=_STATELESS,
 )
 
 
