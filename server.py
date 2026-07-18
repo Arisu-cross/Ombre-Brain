@@ -527,11 +527,12 @@ def _passes_date_filter(meta: dict, date_from: str, date_to: str) -> bool:
 def _archived_sort_key(b: dict) -> str:
     """归档桶排序键：按真实归档时刻 archived_at 排序。
 
-    存量老桶没有 archived_at 时回退 last_active/created（last_active 可能被
-    后续批量操作重写，所以 archived_at 优先）。
+    存量老桶没有 archived_at 时回退 created——会话总结桶的 created 就是归档
+    时刻，可靠；last_active 会被批量操作刷成同一时刻导致顺序随缘，只作最后兜底。
     """
     meta = b["metadata"]
-    return str(meta.get("archived_at", meta.get("last_active", meta.get("created", ""))))
+    # or 链而非 get 默认值:空字符串的 archived_at(存量脏数据)也要落到下一级
+    return str(meta.get("archived_at") or meta.get("created") or meta.get("last_active") or "")
 
 
 async def _render_pinned(pinned_buckets: list, mode: str) -> list:
