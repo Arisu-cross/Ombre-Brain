@@ -144,3 +144,19 @@ async def test_wake_empty_state(patched_server, bucket_mgr):
     """空库时给出明确的空态提示。"""
     out = await patched_server.breath(wake=True)
     assert "没有" in out
+
+
+@pytest.mark.asyncio
+async def test_wake_legacy_buckets_sort_by_created(patched_server, bucket_mgr):
+    """存量老桶(无 archived_at)按 created 排序,不被批量刷新的 last_active 带偏。"""
+    old_id = await bucket_mgr.create(content="旧总结", name="旧总结", domain=["日常"])
+    new_id = await bucket_mgr.create(content="新总结", name="新总结", domain=["日常"])
+    assert await bucket_mgr.archive(old_id)
+    assert await bucket_mgr.archive(new_id)
+    # 模拟老数据:删掉 archived_at,created 一旧一新,last_active 被批量刷成同一时刻
+    await _set_meta(bucket_mgr, old_id, archived_at="", created="2024-01-01T00:00:00", last_active="2025-12-31T00:00:00")
+    await _set_meta(bucket_mgr, new_id, archived_at="", created="2024-06-01T00:00:00", last_active="2025-12-31T00:00:00")
+
+    out = await patched_server.breath(wake=True, max_results=1)
+    assert new_id in out, "should pick the bucket with newer created"
+    assert old_id not in out
