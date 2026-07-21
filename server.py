@@ -1763,10 +1763,34 @@ async def archive_session(
     valence: float = -1,
     arousal: float = -1,
 ) -> str:
-    """将对话摘要存入归档区。summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。"""
+    """将【自上次归档以来】的新对话摘要存入归档区。
+
+    ⚠️ 增量归档:summary 只写「上次归档之后」发生的新内容,不要把已经归档过的
+    对话(比如今天早些时候归过的那段)再抄一遍——否则同一段会被记两遍。
+    不确定上次归到哪,就以返回里的「上次归档」时刻为界,只总结那之后的。
+
+    summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。"""
     if not summary or not summary.strip():
         return "summary 不能为空。"
     await decay_engine.ensure_started()
+
+    # 查上次会话归档的时刻，作为增量边界提示回给沈渡（他据此判断"这次只记哪段"）
+    last_archive_label = ""
+    try:
+        _all = await bucket_mgr.list_all(include_archive=True)
+        _prev = [
+            b for b in _all
+            if b["metadata"].get("type") == "archived"
+            and "session" in (b["metadata"].get("tags") or [])
+        ]
+        if _prev:
+            _prev.sort(key=_archived_sort_key, reverse=True)
+            _pm = _prev[0]["metadata"]
+            last_archive_label = str(
+                _pm.get("archived_at") or _pm.get("created") or ""
+            )[:16].replace("T", " ")
+    except Exception as e:
+        logger.warning(f"archive_session last-archive lookup failed: {e}")
 
     parts = [f"# 会话摘要\n{summary.strip()}"]
     if highlights and highlights.strip():
@@ -1806,7 +1830,8 @@ async def archive_session(
         logger.warning(f"archive_session archive move failed: {e}")
 
     status = "已存入归档" if archived else "已创建(归档移动失败,暂留动态区)"
-    return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}"
+    prev_hint = f"｜上次归档: {last_archive_label}" if last_archive_label else "｜上次归档: 无(首次)"
+    return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}{prev_hint}"
 
 
 # =============================================================
