@@ -86,8 +86,12 @@ BREATH_RECENT_N = int(os.environ.get("BREATH_RECENT_N", "3") or "3")
 # 会把最该保留的语气与细节磨平——正是"老内容被反复摘要越来越糊"那个老问题。
 # 想退回旧行为:设 BREATH_WAKE_ARCHIVE_MODE=summary(单行)或 full(脱水)。
 BREATH_WAKE_ARCHIVE_MODE = (os.environ.get("BREATH_WAKE_ARCHIVE_MODE") or "raw").strip().lower()
-# 单条归档原文的 token 上限,防止某一条超长桶吃光预算(超出部分截断并标注)。
-BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "1200") or "1200")
+# 单条归档原文的 token 上限,防止某一条异常大的桶吃光预算(超出截断并标注)。
+# 3000 是照真实数据定的:实测归档普遍 350~1900 token,五条全展开约 6000,
+# 预算 10000 放得下。初版设 1200 太紧,砍掉了最长两条的尾巴——而归档的
+# 「## 亮点 / ## 心情」恰好写在末尾,截断等于精准切掉最该看到的情绪总结。
+# 这里只作异常防护,正常归档不该触发;真正的总量约束是外层 token_budget。
+BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "3000") or "3000")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -586,7 +590,10 @@ def _truncate_to_tokens(text: str, limit: int) -> str:
             lo = mid
         else:
             hi = mid - 1
-    return text[:lo].rstrip() + "\n…(原文过长已截断,要全文用 trace(bucket_id) 取)"
+    # 不写「用 xx 取全文」——OB 没有按 bucket_id 读原文的工具:trace 是改不是读,
+    # dream(detail_ids) 只覆盖最近新增的桶,breath(query) 走的是脱水全文。
+    # 与其指一条走不通的路让他白跑,不如只如实说明这里被截断了。
+    return text[:lo].rstrip() + "\n…(原文过长,此处截断)"
 
 
 async def _render_archived(
@@ -777,7 +784,7 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会截断并提示用trace(bucket_id)取全文。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
+    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会截断并标注(默认3000,正常归档不触发)。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)

@@ -85,11 +85,11 @@ async def test_explicit_mode_summary_still_respected(patched_server, bucket_mgr)
 
 @pytest.mark.asyncio
 async def test_oversized_archive_is_truncated(patched_server, bucket_mgr, monkeypatch):
-    """超长归档要截断并指路 trace,不能吃光 token 预算。"""
+    """超长归档要截断并标注,不能吃光 token 预算。"""
     monkeypatch.setattr(server_mod, "BREATH_RAW_MAX_TOKENS", 200)
     await _make_archive(bucket_mgr, content="很长的一段回忆。" * 400)
     out = await patched_server.breath(wake=True)
-    assert "已截断" in out and "trace" in out
+    assert "此处截断" in out
 
 
 @pytest.mark.asyncio
