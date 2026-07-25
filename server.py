@@ -86,6 +86,10 @@ BREATH_RECENT_N = int(os.environ.get("BREATH_RECENT_N", "3") or "3")
 # 会把最该保留的语气与细节磨平——正是"老内容被反复摘要越来越糊"那个老问题。
 # 想退回旧行为:设 BREATH_WAKE_ARCHIVE_MODE=summary(单行)或 full(脱水)。
 BREATH_WAKE_ARCHIVE_MODE = (os.environ.get("BREATH_WAKE_ARCHIVE_MODE") or "raw").strip().lower()
+# 唤醒时浮现几条归档。三条路径(无query breath / wake+startup / breath-hook)统一用它,
+# 免得改了一处忘了另两处。改成原文呈现后每条约 350~1900 token,条数直接决定开窗成本:
+# 5 条≈6100、3 条≈4600(预算 10000)。想省 token 或觉得摊太开就调小,想要更长的连续性就调大。
+BREATH_ARCHIVE_N = int(os.environ.get("BREATH_ARCHIVE_N", "5") or "5")
 # 单条归档原文的 token 上限,防止某一条异常大的桶吃光预算(超出截断并标注)。
 # 3000 是照真实数据定的:实测归档普遍 350~1900 token,五条全展开约 6000,
 # 预算 10000 放得下。初版设 1200 太紧,砍掉了最长两条的尾巴——而归档的
@@ -361,8 +365,8 @@ async def health_check(request):
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
-        HOOK_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
-        HOOK_ARCHIVE_MIN = 2      # 归档条数下限：保底 2 条（2-5 条区间）
+        HOOK_ARCHIVE_DEFAULT = BREATH_ARCHIVE_N  # 归档条数上限（env BREATH_ARCHIVE_N）
+        HOOK_ARCHIVE_MIN = min(2, BREATH_ARCHIVE_N)  # 下限：保底这么多（不超过上限）
         all_buckets = await bucket_mgr.list_all(include_archive=True)
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
@@ -816,8 +820,8 @@ async def breath(
     # 唤醒时不触发 Dreaming、不带 feel：dream/feel 只在被显式调用时才出现。
     # （startup 旧行为曾打包 Dreaming + 最近 feel，现与 wake 统一为纯唤醒浮现。）
     if startup or wake:
-        WAKE_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
-        WAKE_ARCHIVE_MIN = 2      # 归档条数下限：token 预算再紧也保底 2 条
+        WAKE_ARCHIVE_DEFAULT = BREATH_ARCHIVE_N  # 归档条数上限（env BREATH_ARCHIVE_N）
+        WAKE_ARCHIVE_MIN = min(2, BREATH_ARCHIVE_N)  # 下限：预算再紧也保底这么多（不超过上限）
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=True)
         except Exception as e:
@@ -921,8 +925,8 @@ async def breath(
     # 普通动态桶（hold 写入的）不出现在这里，只作为语义搜索（query 非空）的检索库；
     # 语义浮现（权重排序/冷启动/多样性采样）见下方 "With args: search mode" 分支。
     if not query or not query.strip():
-        BREATH_ARCHIVE_DEFAULT = 5  # 归档条数上限：默认取最近 5 条
-        BREATH_ARCHIVE_MIN = 2      # 归档条数下限：保底 2 条（2-5 条区间）
+        BREATH_ARCHIVE_DEFAULT = BREATH_ARCHIVE_N  # 归档条数上限（env BREATH_ARCHIVE_N）
+        BREATH_ARCHIVE_MIN = min(2, BREATH_ARCHIVE_N)  # 下限：保底这么多（不超过上限）
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=True)
         except Exception as e:

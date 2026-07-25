@@ -11,7 +11,7 @@
 #   - 唤醒/无 query/startup/breath-hook 的归档段包含原文正文,不只是标题行
 #   - 归档原文不经过 dehydrate(不额外烧 LLM,也不被二次压缩)
 #   - 显式传 mode 时尊重调用方
-#   - 超长桶按 token 预算截断并提示改用 trace
+#   - 超长桶按 token 预算截断并标注;浮现条数可由 BREATH_ARCHIVE_N 调节
 #   - 「最近记下」仍是单行线索(与既有设计一致,未被本次改动波及)
 # ============================================================
 
@@ -110,3 +110,17 @@ def test_truncate_helper_respects_token_budget():
         assert count_tokens_approx(out) <= 1200 + 80, count_tokens_approx(out)
     short = "很短的一句话。"
     assert server_mod._truncate_to_tokens(short, 1200) == short
+
+
+@pytest.mark.asyncio
+async def test_archive_count_configurable(patched_server, bucket_mgr, monkeypatch):
+    """BREATH_ARCHIVE_N 能控制浮现条数,且下限不会把超额的条数塞回来。"""
+    for i in range(5):
+        await _make_archive(bucket_mgr, content=f"第{i}段回忆的内容。", name=f"归档{i}")
+    monkeypatch.setattr(server_mod, "BREATH_ARCHIVE_N", 3)
+    out = await patched_server.breath()
+    assert out.count("🗄️ [归档]") == 3, out.count("🗄️ [归档]")
+
+    monkeypatch.setattr(server_mod, "BREATH_ARCHIVE_N", 1)
+    out = await patched_server.breath()
+    assert out.count("🗄️ [归档]") == 1, "下限 2 不该把条数顶回 2 条"
