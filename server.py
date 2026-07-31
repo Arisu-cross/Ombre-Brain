@@ -90,6 +90,10 @@ BREATH_WAKE_ARCHIVE_MODE = (os.environ.get("BREATH_WAKE_ARCHIVE_MODE") or "raw")
 # 免得改了一处忘了另两处。改成原文呈现后每条约 350~1900 token,条数直接决定开窗成本:
 # 5 条≈6100、3 条≈4600(预算 10000)。想省 token 或觉得摊太开就调小,想要更长的连续性就调大。
 BREATH_ARCHIVE_N = int(os.environ.get("BREATH_ARCHIVE_N", "5") or "5")
+# 归档按天合并:同一天只有一个档案桶,当天再次归档往里追加一节(而不是每次新建一个)。
+# 每次新建会让一天碎成好几份 —— 浮现时既占「最近 N 条」的名额,读起来也不连贯。
+# 合并后「最近 N 条归档」≈ 最近 N 天。设 0 退回旧行为(每次一个新桶)。
+ARCHIVE_MERGE_BY_DAY = (os.environ.get("ARCHIVE_MERGE_BY_DAY", "1") or "1").strip() not in ("0", "false", "False")
 # 单条归档原文的 token 上限,防止某一条异常大的桶吃光预算(超出截断并标注)。
 # 3000 是照真实数据定的:实测归档普遍 350~1900 token,五条全展开约 6000,
 # 预算 10000 放得下。初版设 1200 太紧,砍掉了最长两条的尾巴——而归档的
@@ -1834,6 +1838,9 @@ async def archive_session(
     对话(比如今天早些时候归过的那段)再抄一遍——否则同一段会被记两遍。
     不确定上次归到哪,就以返回里的「上次归档」时刻为界,只总结那之后的。
 
+    同一天多次归档会合并进「会话归档 YYYY-MM-DD」这一个档案里(按时刻分节追加),
+    不会每次新建。所以放心随时归,不会把一天弄碎。
+
     summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。"""
     if not summary or not summary.strip():
         return "summary 不能为空。"
@@ -1857,44 +1864,92 @@ async def archive_session(
     except Exception as e:
         logger.warning(f"archive_session last-archive lookup failed: {e}")
 
-    parts = [f"# 会话摘要\n{summary.strip()}"]
-    if highlights and highlights.strip():
-        parts.append(f"\n## 亮点\n{highlights.strip()}")
-    if mood and mood.strip():
-        parts.append(f"\n## 心情\n{mood.strip()}")
-    content = "\n".join(parts)
-
     v = valence if 0 <= valence <= 1 else 0.5
     a = arousal if 0 <= arousal <= 1 else 0.3
-    name = f"会话归档 {now_iso()[:16].replace('T', ' ')}"
+    _now = now_iso()
+    today = _now[:10]            # YYYY-MM-DD
+    hhmm = _now[11:16]           # HH:MM
 
-    try:
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=["会话", "归档", "session"],
-            importance=4,
-            domain=["归档"],
-            valence=v,
-            arousal=a,
-            name=name,
-            bucket_type="dynamic",
-        )
-    except Exception as e:
-        logger.error(f"archive_session create failed: {e}")
-        return f"归档失败: {e}"
+    # 这一次归档的正文段落(合并模式下作为当天档案里的一节)
+    seg = [f"## {hhmm}\n{summary.strip()}"]
+    if highlights and highlights.strip():
+        seg.append(f"\n**亮点**:{highlights.strip()}")
+    if mood and mood.strip():
+        seg.append(f"\n**心情**:{mood.strip()}")
+    segment = "\n".join(seg)
+
+    # ── 按天合并:同一天只有一个档案,当天再次归档就往里追加一节 ──────────────
+    # 为什么:每次归档都新建一个桶 → 一天下来碎成好几份,浮现时既占名额又读不出连贯。
+    # 合并后「最近 N 条归档」= 最近 N 天,连续性明显更好。
+    # 跨天(或 ARCHIVE_MERGE_BY_DAY=0)才开新档。
+    day_name = f"会话归档 {today}"
+    target = None
+    if ARCHIVE_MERGE_BY_DAY:
+        try:
+            for b in await bucket_mgr.list_all(include_archive=True):
+                m = b["metadata"]
+                if m.get("type") == "archived" and m.get("name") == day_name:
+                    target = b
+                    break
+        except Exception as e:
+            logger.warning(f"archive_session day-bucket lookup failed: {e}")
+
+    if target:
+        # 追加:正文接一节;archived_at 刷到本次,否则排序与「上次归档」边界仍停在当天首次
+        bucket_id = target["id"]
+        content = target["content"].rstrip() + "\n\n" + segment
+        try:
+            if not await bucket_mgr.update(bucket_id, content=content, valence=v, arousal=a):
+                raise RuntimeError("update 返回 False(没找到该桶)")
+            await bucket_mgr.touch_archived_at(bucket_id, _now)
+        except Exception as e:
+            logger.error(f"archive_session append failed: {e}")
+            return f"归档失败(追加): {e}"
+        name, merged = day_name, True
+    else:
+        if ARCHIVE_MERGE_BY_DAY:
+            content, name = f"# {day_name}\n\n{segment}", day_name
+        else:
+            legacy = [f"# 会话摘要\n{summary.strip()}"]
+            if highlights and highlights.strip():
+                legacy.append(f"\n## 亮点\n{highlights.strip()}")
+            if mood and mood.strip():
+                legacy.append(f"\n## 心情\n{mood.strip()}")
+            content = "\n".join(legacy)
+            name = f"会话归档 {_now[:16].replace('T', ' ')}"
+        merged = False
+        try:
+            bucket_id = await bucket_mgr.create(
+                content=content,
+                tags=["会话", "归档", "session"],
+                importance=4,
+                domain=["归档"],
+                valence=v,
+                arousal=a,
+                name=name,
+                bucket_type="dynamic",
+            )
+        except Exception as e:
+            logger.error(f"archive_session create failed: {e}")
+            return f"归档失败: {e}"
 
     try:
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
 
-    archived = False
-    try:
-        archived = await bucket_mgr.archive(bucket_id)
-    except Exception as e:
-        logger.warning(f"archive_session archive move failed: {e}")
+    # 追加进已归档的当天档案时不要再 archive 一次:它已经在归档区,
+    # 再走一遍只会重写 archived_at(把刚 touch 的值又盖掉)并做无谓的文件移动。
+    if merged:
+        status = "已追加进今天的档案"
+    else:
+        archived = False
+        try:
+            archived = await bucket_mgr.archive(bucket_id)
+        except Exception as e:
+            logger.warning(f"archive_session archive move failed: {e}")
+        status = "已存入归档" if archived else "已创建(归档移动失败,暂留动态区)"
 
-    status = "已存入归档" if archived else "已创建(归档移动失败,暂留动态区)"
     prev_hint = f"｜上次归档: {last_archive_label}" if last_archive_label else "｜上次归档: 无(首次)"
     return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}{prev_hint}"
 

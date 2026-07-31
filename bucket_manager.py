@@ -263,6 +263,27 @@ class BucketManager:
         async with self._lock_for(bucket_id):
             return await self._update_unlocked(bucket_id, **kwargs)
 
+    async def touch_archived_at(self, bucket_id: str, when: str = None) -> bool:
+        """把归档桶的 archived_at 刷成指定时刻(默认现在)。
+
+        `update()` 只认白名单字段,写不了 archived_at。而按天合并归档时,
+        当天档案被追加新内容后必须刷新这个时刻——否则「最近归档」的排序和
+        archive_session 回给他的「上次归档」边界都还停在当天第一次归档上。
+        """
+        async with self._lock_for(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+            try:
+                post = frontmatter.load(file_path)
+                post["archived_at"] = when or now_iso()
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                return True
+            except Exception as e:
+                logger.warning(f"touch_archived_at failed / 刷新归档时刻失败: {bucket_id}: {e}")
+                return False
+
     async def _update_unlocked(self, bucket_id: str, **kwargs) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
