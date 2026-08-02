@@ -100,6 +100,11 @@ ARCHIVE_MERGE_BY_DAY = (os.environ.get("ARCHIVE_MERGE_BY_DAY", "1") or "1").stri
 # 「## 亮点 / ## 心情」恰好写在末尾,截断等于精准切掉最该看到的情绪总结。
 # 这里只作异常防护,正常归档不该触发;真正的总量约束是外层 token_budget。
 BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "3000") or "3000")
+# 唤醒(无 query 的 breath / wake / startup / breath-hook)一次浮现的 token 总预算。
+# 原来写死 10000。按天合并之后一个归档桶 = 一整天,忙的一天就能顶掉大半预算,
+# 于是更早的天被整条挤掉。做成可调:想让他看全就调大,想省 token 就调小。
+# ⚠️ 这是**每开一个新窗口的一次性成本**(之后每轮按缓存价重读),调大要心里有数。
+BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -380,7 +385,7 @@ async def breath_hook(request):
         archived = archived[:HOOK_ARCHIVE_DEFAULT]
 
         parts = await _render_pinned(pinned, "full")
-        token_budget = 10000
+        token_budget = BREATH_WAKE_BUDGET
         for r in parts:
             token_budget -= count_tokens_approx(r)
         # 归档给原文(默认 raw):它已是 archive_session 精炼过的「给下一个自己的信」,
@@ -389,7 +394,7 @@ async def breath_hook(request):
             archived, BREATH_WAKE_ARCHIVE_MODE, token_budget, min_keep=HOOK_ARCHIVE_MIN
         )
         # 最近记下的动态桶:单行摘要即可(线索行,细节让他自己 breath 查),不烧脱水 API
-        token_budget = 10000 - sum(count_tokens_approx(x) for x in parts)
+        token_budget = BREATH_WAKE_BUDGET - sum(count_tokens_approx(x) for x in parts)
         parts += await _render_archived(
             _recent_dynamic(all_buckets, BREATH_RECENT_N), "summary", token_budget,
             min_keep=1, prefix="📝 [最近记下] ",
@@ -868,7 +873,7 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会截断并标注(默认3000,正常归档不触发)。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
+    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它按 env BREATH_WAKE_BUDGET,默认10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会按「## HH:MM」分节裁、保最近几节并标注(env BREATH_RAW_MAX_TOKENS,设0=不限)。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -889,9 +894,9 @@ async def breath(
     auto_tokens = max_tokens is None or max_tokens < 1
     is_search = bool((query or "").strip()) and domain.strip().lower() != "feel"
     if auto_tokens:
-        max_tokens = 5000 if (is_search and auto_results) else 10000
+        max_tokens = 5000 if (is_search and auto_results) else BREATH_WAKE_BUDGET
     else:
-        max_tokens = min(max_tokens, 20000)
+        max_tokens = min(max_tokens, max(20000, BREATH_WAKE_BUDGET))
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
 
