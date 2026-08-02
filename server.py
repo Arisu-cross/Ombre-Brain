@@ -604,6 +604,82 @@ def _truncate_to_tokens(text: str, limit: int) -> str:
     return text[:lo].rstrip() + "\n…(原文过长,此处截断)"
 
 
+# 一天一个档案(archive_session 按天合并)之后,忙的一天会有好几节:
+#   # 会话归档 2026-08-02
+#   ## 01:24 …  ## 15:43 …  ## 19:33 …
+# 从头往后砍等于**把今天最近发生的事切掉**,他醒来读到的是凌晨那节 ——
+# 2026-08-02 就这么撞上了:用户说「breath 的时候说八月二号的归档内容太长被截断了,
+# 沈渡那边看不见」。所以改成按节裁:**保最近的几节**,老的整节省略并如实说明。
+_SECTION_RE = re.compile(r"^##\s+\d{1,2}:\d{2}\s*$", re.M)
+
+
+def _split_archive_sections(text: str):
+    """把当天档案拆成 (抬头, [节…])。没有 `## HH:MM` 结构就返回 (text, [])。"""
+    marks = list(_SECTION_RE.finditer(text))
+    if not marks:
+        return text, []
+    head = text[: marks[0].start()].rstrip()
+    sections = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        sections.append(text[m.start(): end].rstrip())
+    return head, sections
+
+
+def _truncate_section_keep_ends(section: str, limit: int) -> str:
+    """单节太长时,保住开头**和结尾**。
+
+    归档的写法是正文在前、`**亮点**` / `**心情**` 收在最后 —— 直接截尾正好把
+    最该看见的情绪总结切掉(2026-07-25 已经吃过一次这个亏)。所以掐中间。
+    """
+    if count_tokens_approx(section) <= limit:
+        return section
+    lines = section.split("\n")
+    tail_lines = [ln for ln in lines[-6:] if ln.startswith("**")]
+    tail = "\n".join(tail_lines)
+    tail_tokens = count_tokens_approx(tail) if tail else 0
+    note = "\n…(这一节太长,中间略去)\n"
+    head_budget = limit - tail_tokens - count_tokens_approx(note)
+    if head_budget <= 0:
+        return _truncate_to_tokens(section, limit)
+    head = _truncate_to_tokens(section, head_budget)
+    head = head.replace("\n…(原文过长,此处截断)", "")
+    return head.rstrip() + note + tail if tail else head
+
+
+def _truncate_archive_raw(text: str, limit: int) -> str:
+    """归档原文裁到预算内:**按节保最近的**,再不够才在节内掐中间。"""
+    if limit <= 0 or count_tokens_approx(text) <= limit:
+        return text
+    head, sections = _split_archive_sections(text)
+    if not sections:
+        return _truncate_to_tokens(text, limit)
+
+    head_tokens = count_tokens_approx(head)
+    kept: list = []
+    used = head_tokens
+    for sec in reversed(sections):                      # 从最近的一节往回收
+        sec_tokens = count_tokens_approx(sec)
+        note_tokens = 40                                # 给省略说明留点余量
+        if kept and used + sec_tokens + note_tokens > limit:
+            break
+        if not kept and used + sec_tokens > limit:
+            # 连最近这一节都放不下:节内掐中间,保住开头与亮点/心情
+            kept.append(_truncate_section_keep_ends(sec, max(limit - head_tokens - note_tokens, 200)))
+            used = limit
+            break
+        kept.append(sec)
+        used += sec_tokens
+    kept.reverse()
+
+    omitted = len(sections) - len(kept)
+    parts = [head] if head else []
+    if omitted > 0:
+        parts.append(f"…(这一天更早的 {omitted} 节已省略,下面是最近的)")
+    parts.extend(kept)
+    return "\n\n".join(p for p in parts if p).strip()
+
+
 async def _render_archived(
     archived_buckets: list, mode: str, token_budget: int, min_keep: int = 0,
     prefix: str = "🗄️ [归档] ",
@@ -630,7 +706,7 @@ async def _render_archived(
             if mode == "raw":
                 # 原文直出:归档内容本身已是精炼过的「写给下一个自己的信」,不再脱水,
                 # 免得二次摘要把语气和细节磨平。超长的单条截断,不让它吃光预算。
-                body = _truncate_to_tokens(
+                body = _truncate_archive_raw(
                     strip_wikilinks(b["content"]).strip(), BREATH_RAW_MAX_TOKENS
                 )
                 name = b.get("metadata", {}).get("name", b["id"])
