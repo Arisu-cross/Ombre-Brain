@@ -193,10 +193,32 @@ class DecayEngine:
         archived = 0
         auto_resolved = 0
         dormant_marked = 0
+        expired_deleted = 0   # 便利贴到期撕掉的数量
         lowest_score = float("inf")
 
         for bucket in buckets:
             meta = bucket.get("metadata", {})
+
+            # --- 便利贴到期:彻底撕掉(她选的:过期就删,不留档)。放在最前面,先于一切衰减逻辑。---
+            # 只有带 expires_at 的动态桶(hold remember_days 写的)会命中;普通记忆没这字段,不受影响。
+            # 时间戳坏了当没过期(宁可多留一天也不误删),交给后续正常衰减处理。
+            exp = meta.get("expires_at")
+            if exp:
+                try:
+                    _due = now_local() >= datetime.fromisoformat(str(exp))
+                except (ValueError, TypeError):
+                    _due = False
+                if _due:
+                    try:
+                        if await self.bucket_mgr.delete(bucket["id"]):
+                            expired_deleted += 1
+                            logger.info(
+                                f"便利贴到期撕掉 / expired note deleted: "
+                                f"{meta.get('name', bucket['id'])} (expired_at={exp})"
+                            )
+                    except Exception as e:
+                        logger.warning(f"删除到期便利贴失败 / delete expired failed: {e}")
+                    continue
 
             # Skip permanent / pinned / protected / feel buckets
             # 跳过固化桶、钉选/保护桶和 feel 桶
@@ -290,6 +312,7 @@ class DecayEngine:
             "archived": archived,
             "auto_resolved": auto_resolved,
             "dormant_marked": dormant_marked,
+            "expired_deleted": expired_deleted,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")

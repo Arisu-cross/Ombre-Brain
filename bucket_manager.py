@@ -129,6 +129,7 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        expires_at: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -171,6 +172,10 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        # 便利贴：到点自动撕掉的短期记忆。只有普通动态桶带这个字段；
+        # 钉选/永久/feel 桶本就该长留，不设过期（hold 侧已保证不会传进来）。
+        if expires_at:
+            metadata["expires_at"] = expires_at
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---

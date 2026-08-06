@@ -58,7 +58,8 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
+from datetime import timedelta, datetime
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -735,6 +736,18 @@ async def _render_archived(
     return results
 
 
+def _is_expired(meta: dict) -> bool:
+    """便利贴是否已过期。没有 expires_at 的普通记忆永远返回 False(不受影响)。
+    时间戳坏了当没过期处理——宁可多留一张便利贴,也不误删。"""
+    exp = meta.get("expires_at")
+    if not exp:
+        return False
+    try:
+        return now_local() >= datetime.fromisoformat(str(exp))
+    except (ValueError, TypeError):
+        return False
+
+
 def _recent_dynamic(all_buckets: list, limit: int) -> list:
     """hold 写入的普通动态桶，按 last_active（回退 created）降序取最近几条。
 
@@ -750,6 +763,7 @@ def _recent_dynamic(all_buckets: list, limit: int) -> list:
         and not b["metadata"].get("pinned")
         and not b["metadata"].get("protected")
         and not b["metadata"].get("dormant")
+        and not _is_expired(b["metadata"])   # 便利贴过期即刻不再浮现(物理删除交给 decay 巡查)
     ]
     dyn.sort(
         key=lambda b: str(b["metadata"].get("last_active", b["metadata"].get("created", ""))),
@@ -1253,8 +1267,9 @@ async def hold(
     feel: bool = False,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
+    remember_days: int = 0,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。remember_days=只想记几天的临时便利贴(如她说"明天要去医院"这类):到点自动撕掉、不进长期记忆、这几天里正常浮现在「最近记下」;0=普通记忆(默认);与pinned/feel互斥。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1338,6 +1353,31 @@ async def hold(
         except Exception:
             pass
         return f"📌钉选→{bucket_id} {','.join(domain)}"
+
+    # --- 便利贴:只记几天、到点自动撕掉的临时记忆 ---
+    # 像钉选一样**跳过合并**——便利贴是独立的一条,不该被并进长期桶
+    # (并进去过期时间会丢,还会连累那个长期桶跟着被撕)。
+    # 到期物理删除交给 decay_engine 每日巡查;浮现层(_recent_dynamic)另做即时过滤,
+    # 所以就算 decay 还没跑到,过期的便利贴也不会再冒到他眼前。
+    if remember_days and remember_days > 0:
+        days = max(1, min(90, int(remember_days)))   # 夹在 1~90 天,防呆
+        expires_at = (now_local() + timedelta(days=days)).isoformat()
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=all_tags,
+            importance=importance,
+            domain=domain,
+            valence=final_valence,
+            arousal=final_arousal,
+            name=suggested_name or None,
+            bucket_type="dynamic",
+            expires_at=expires_at,
+        )
+        try:
+            await embedding_engine.generate_and_store(bucket_id, content)
+        except Exception:
+            pass
+        return f"🗒️便利贴→{bucket_id} 记{days}天 {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
     result_name, is_merged = await _merge_or_create(
