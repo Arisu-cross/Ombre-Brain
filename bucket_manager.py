@@ -271,6 +271,33 @@ class BucketManager:
         async with self._lock_for(bucket_id):
             return await self._update_unlocked(bucket_id, **kwargs)
 
+    # 分层归档(周记/月记)用的系统字段。走 update() 写不进去——那是给内容/元数据
+    # 用的白名单，而且会顺手刷 last_active；这些是系统自己的记账，不该算"被碰过"。
+    _SYSTEM_FIELDS = {"rollup_kind", "rollup_period", "rolled_up", "rolled_into"}
+
+    async def set_system_fields(self, bucket_id: str, **fields) -> bool:
+        """写入系统记账字段（不刷 last_active，不唤醒休眠）。"""
+        unknown = set(fields) - self._SYSTEM_FIELDS
+        if unknown:
+            raise ValueError(f"不是系统字段 / not a system field: {sorted(unknown)}")
+        async with self._lock_for(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+            try:
+                post = frontmatter.load(file_path)
+                for k, v in fields.items():
+                    if v is None:
+                        post.metadata.pop(k, None)
+                    else:
+                        post[k] = v
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                return True
+            except OSError as e:
+                logger.warning(f"set_system_fields failed / 写系统字段失败: {bucket_id}: {e}")
+                return False
+
     async def touch_archived_at(self, bucket_id: str, when: str = None) -> bool:
         """把归档桶的 archived_at 刷成指定时刻(默认现在)。
 

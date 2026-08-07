@@ -26,6 +26,18 @@
 | `OMBRE_BACKUP_SUBDIR` | 否 | `backups` | 备份 JSON 在仓库内的子目录，也是 `git add` 的**唯一**范围（避免误提交 workflow 文件） |
 | `OMBRE_BACKUP_TIME` | 否 | `00:10` | 每日定时备份时间 `HH:MM`（24 小时制，按服务器本地时区） |
 | `OMBRE_BACKUP_WORKDIR` | 否 | `{buckets_dir}/.ob-backup-repo` | 备份仓库本地克隆目录（默认放在 buckets 目录下，随持久化磁盘保留） |
+| `DREAM_ARCHIVE_N` | 否 | `3` | `dream()` 回想时带几条「还没消化过的归档」，设 `0` 关闭（回到只看最近新记的） |
+| `DREAM_ARCHIVE_DAYS` | 否 | `14` | 只带最近多少天内的归档 |
+| `DREAM_ARCHIVE_PREVIEW` | 否 | `300` | 归档在 dream 里的预览字数；全文用 `dream(detail_ids=...)` |
+| `WAKE_DIGEST_HINT_MIN` | 否 | `2` | 唤醒时未消化的归档达到几条才附那行提醒，设 `0` 关闭 |
+| `OMBRE_ROLLUP_ENABLED` | 否 | `true` | 归档分层（周记/月记）总开关 |
+| `OMBRE_ROLLUP_DAILY_DAYS` | 否 | `7` | 日档保留几天不卷；超过就按自然周合成周记 |
+| `OMBRE_ROLLUP_WEEKLY_DAYS` | 否 | `30` | 周记满多少天卷成月记 |
+| `OMBRE_ROLLUP_MODEL` | 否 | 沿用脱水配置 | 写周记/月记用的模型（如 `deepseek-chat`） |
+| `OMBRE_ROLLUP_BASE_URL` | 否 | 沿用脱水配置 | 写周记/月记的 API 地址（如 `https://api.deepseek.com/v1`） |
+| `OMBRE_ROLLUP_API_KEY` | 否 | 沿用脱水配置 | 写周记/月记的 Key；三个都不设就跟脱水走同一家 |
+| `OMBRE_ROLLUP_MAX_TOKENS` | 否 | `1500` | 单条周记/月记的生成上限 |
+| `OMBRE_ROLLUP_INTERVAL_H` | 否 | `24` | 分层巡查间隔（小时） |
 | `OMBRE_BACKUP_GIT_NAME` | 否 | `Ombre Brain Backup` | 备份 commit 的 author name |
 | `OMBRE_BACKUP_GIT_EMAIL` | 否 | `ombre-backup@users.noreply.github.com` | 备份 commit 的 author email |
 
@@ -37,6 +49,25 @@
 - 手动触发：`POST /api/backup/run`（需 Dashboard 认证）。
 - 查看状态：`GET /api/backup/status`。
 - **`git add` 范围被严格限定为 `OMBRE_BACKUP_SUBDIR`**（默认 `backups/`），绝不暂存仓库根目录或 `.github/workflows/`，以免触发 GitHub Actions 默认 token 无 `workflow` 权限导致 push 被拒。
+
+## 归档分层 (`OMBRE_ROLLUP_*`)
+
+`archive_session` 每天写一个日档，唤醒只浮现最近几条 —— 时间一长，更早的日子既不会
+自己浮上来，也没有更粗的替身。分层引擎按「越久越粗，但不断线」来收：
+
+| 年龄 | 呈现 |
+|---|---|
+| 最近 7 天 | 日档原样浮现 |
+| 超过 7 天 | 按自然周（周一~周日）合成一条「周记 YYYY-Www」 |
+| 周记超过 30 天 | 按月合成一条「月记 YYYY-MM」 |
+
+- **原档永远保留**，只是打上 `rolled_up` 标记后不再单独浮现；搜索照样搜得到，
+  周记/月记正文里也写着源档案的 id，随时能查回去。
+- 只卷**已经结束**的周期（本周没过完不会提前封盘），同一轮里可以级联
+  （日档 → 周记 → 月记），首次上线时积压的历史档案一次补齐。
+- 手动触发：`POST /api/rollup/run`；查看状态：`GET /api/rollup/status`（都需认证）。
+- 想让它单独走另一家模型（例如周记/月记走 DeepSeek，脱水仍走原来的），设
+  `OMBRE_ROLLUP_MODEL` / `_BASE_URL` / `_API_KEY` 三个即可；不设就沿用脱水配置。
 
 ## 说明
 

@@ -58,6 +58,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
+from rollup_engine import RollupEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
 from datetime import timedelta, datetime
 
@@ -106,6 +107,17 @@ BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "3000") or "
 # 于是更早的天被整条挤掉。做成可调:想让他看全就调大,想省 token 就调小。
 # ⚠️ 这是**每开一个新窗口的一次性成本**(之后每轮按缓存价重读),调大要心里有数。
 BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000")
+# ── 内化(2026-08-07)──────────────────────────────────────────────
+# 归档原来是"只读的档案":唤醒时读最近几天,再往前就只有主动搜才见得到,
+# 而 dream(回想)压根看不到归档——他没法回头消化上周发生的事。
+# 现在 dream 会带上「最近还没消化过的归档」,他读完可以用
+# hold(content=..., source_bucket=归档id) 写成一条普通记忆桶(不钉选),
+# 源档案随即被标记 digested,不再反复提醒。全程他自己决定写不写。
+DREAM_ARCHIVE_N = int(os.environ.get("DREAM_ARCHIVE_N", "3") or "3")       # 回想时带几条归档,0=关闭
+DREAM_ARCHIVE_DAYS = int(os.environ.get("DREAM_ARCHIVE_DAYS", "14") or "14")  # 只带最近多少天内的
+DREAM_ARCHIVE_PREVIEW = int(os.environ.get("DREAM_ARCHIVE_PREVIEW", "300") or "300")  # 预览字数,全文用 detail_ids
+# 唤醒时若有没消化的归档,末尾附一行提醒(纯提示,不是指令)。0 = 关掉这行。
+WAKE_DIGEST_HINT_MIN = int(os.environ.get("WAKE_DIGEST_HINT_MIN", "2") or "2")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -133,6 +145,9 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 backup_engine = BackupEngine(config, bucket_mgr)     # Daily backup engine / 每日备份引擎
+rollup_engine = RollupEngine(                        # Archive rollup / 归档分层(周记·月记)
+    config, bucket_mgr, dehydrator, embedding_engine
+)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -351,6 +366,11 @@ async def health_check(request):
         await backup_engine.ensure_started()
     except Exception as e:
         logger.warning(f"Backup scheduler start failed / 备份调度启动失败: {e}")
+    # 归档分层(周记/月记)同样懒启动,搭同一趟车
+    try:
+        await rollup_engine.ensure_started()
+    except Exception as e:
+        logger.warning(f"Rollup engine start failed / 分层引擎启动失败: {e}")
     try:
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
@@ -358,6 +378,7 @@ async def health_check(request):
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
             "backup_scheduler": "running" if backup_engine.is_running else "stopped",
+            "rollup_engine": "running" if rollup_engine.is_running else "stopped",
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -381,7 +402,11 @@ async def breath_hook(request):
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
         # recent archived session summaries (written by archive_session), by archive time desc
-        archived = [b for b in all_buckets if b["metadata"].get("type") == "archived"]
+        archived = [
+            b for b in all_buckets
+            if b["metadata"].get("type") == "archived"
+            and not b["metadata"].get("rolled_up")   # 已卷进周记/月记的日档不再单独浮现
+        ]
         archived.sort(key=_archived_sort_key, reverse=True)
         archived = archived[:HOOK_ARCHIVE_DEFAULT]
 
@@ -405,6 +430,9 @@ async def breath_hook(request):
             await _fire_webhook("breath_hook", {"surfaced": 0})
             return PlainTextResponse("")
         body_text = "[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts)
+        hint = _digest_hint(all_buckets)
+        if hint:
+            body_text += "\n\n" + hint
         await _fire_webhook("breath_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -465,12 +493,15 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
+    Returns (bucket_id_or_name, is_merged, bucket_id).
     检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    返回 (桶ID或名称, 是否合并, 桶ID)。
+
+    第三个返回值是**确定的桶 id**：第一个返回值合并时给的是桶名（回给沈渡看的），
+    要拿它去写关联/标记源桶会找不到，所以单独把 id 带出来。
     """
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
@@ -503,7 +534,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                return bucket["metadata"].get("name", bucket["id"]), True, bucket["id"]
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -521,7 +552,7 @@ async def _merge_or_create(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, False
+    return bucket_id, False, bucket_id
 
 
 def _summary_line(b: dict, prefix: str = "") -> str:
@@ -748,6 +779,49 @@ def _is_expired(meta: dict) -> bool:
         return False
 
 
+def _digest_hint(all_buckets: list) -> str:
+    """唤醒时那行"还有几天的档案没消化过"。
+
+    只是一句陈述,不是指令——这套系统的规矩是不往他嘴里塞「立刻调用xxx」,
+    要不要回头看是他自己的事(见手册 §6 那次伪指令事故)。
+    条数不到 WAKE_DIGEST_HINT_MIN 就不说话,免得天天念叨。
+    """
+    if WAKE_DIGEST_HINT_MIN <= 0:
+        return ""
+    pending = _undigested_archives(all_buckets, DREAM_ARCHIVE_DAYS)
+    if len(pending) < WAKE_DIGEST_HINT_MIN:
+        return ""
+    return f"💭 还有 {len(pending)} 天的档案你没回头看过（dream() 能读到，想看再看）"
+
+
+def _undigested_archives(all_buckets: list, days: int, limit: int = 0) -> list:
+    """还没被消化过的归档：dream 拿它当回想材料，唤醒拿它数个数提醒。
+
+    条件：归档桶 + digested 不为真 + 归档时刻在最近 days 天内 + 不是已被卷进
+    周记/月记的日档（那些已经有更粗的替身了，不该再单独催他消化一遍）。
+    按归档时刻降序；limit>0 时截断。
+    """
+    if days <= 0:
+        return []
+    cutoff = now_local() - timedelta(days=days)
+    out = []
+    for b in all_buckets:
+        meta = b["metadata"]
+        if meta.get("type") != "archived" or meta.get("digested"):
+            continue
+        if meta.get("rolled_up"):
+            continue
+        ts = _archived_sort_key(b)
+        try:
+            if datetime.fromisoformat(ts) < cutoff:
+                continue
+        except (ValueError, TypeError):
+            continue
+        out.append(b)
+    out.sort(key=_archived_sort_key, reverse=True)
+    return out[:limit] if limit > 0 else out
+
+
 def _recent_dynamic(all_buckets: list, limit: int) -> list:
     """hold 写入的普通动态桶，按 last_active（回退 created）降序取最近几条。
 
@@ -932,7 +1006,9 @@ async def breath(
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
         archived_buckets = [
-            b for b in all_buckets if b["metadata"].get("type") == "archived"
+            b for b in all_buckets
+            if b["metadata"].get("type") == "archived"
+            and not b["metadata"].get("rolled_up")   # 已卷进周记/月记的日档不再单独浮现
         ]
         archived_buckets.sort(key=_archived_sort_key, reverse=True)
         archive_limit = max_results if not auto_results else WAKE_ARCHIVE_DEFAULT
@@ -971,6 +1047,9 @@ async def breath(
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         if recent_results:
             parts.append("=== 最近记下 ===\n" + "\n---\n".join(recent_results))
+        hint = _digest_hint(all_buckets)
+        if hint:
+            parts.append(hint)
         await _fire_webhook(
             "breath",
             {
@@ -1045,6 +1124,7 @@ async def breath(
         archived_buckets = [
             b for b in all_buckets
             if b["metadata"].get("type") == "archived"
+            and not b["metadata"].get("rolled_up")   # 已卷进周记/月记的日档不再单独浮现
             and _passes_date_filter(b["metadata"], date_from, date_to)
             and (include_dormant or not b["metadata"].get("dormant"))
         ]
@@ -1089,6 +1169,9 @@ async def breath(
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         if recent_results:
             parts.append("=== 最近记下 ===\n" + "\n---\n".join(recent_results))
+        hint = _digest_hint(all_buckets)
+        if hint:
+            parts.append(hint)
         return "\n\n".join(parts)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
@@ -1269,7 +1352,7 @@ async def hold(
     arousal: float = -1,
     remember_days: int = 0,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。remember_days=只想记几天的临时便利贴(如她说"明天要去医院"这类):到点自动撕掉、不进长期记忆、这几天里正常浮现在「最近记下」;0=普通记忆(默认);与pinned/feel互斥。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID:feel模式下标记源记忆为已消化;普通模式下用于「内化」——从某段归档里想明白了什么,写成一条普通记忆桶并注明出处,源档案随即标记为已消化(不再出现在dream的回想材料里),两条互相关联。remember_days=只想记几天的临时便利贴(如她说"明天要去医院"这类):到点自动撕掉、不进长期记忆、这几天里正常浮现在「最近记下」;0=普通记忆(默认);与pinned/feel互斥。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1380,7 +1463,7 @@ async def hold(
         return f"🗒️便利贴→{bucket_id} 记{days}天 {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    result_name, is_merged = await _merge_or_create(
+    result_name, is_merged, result_id = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -1390,8 +1473,26 @@ async def hold(
         name=suggested_name,
     )
 
+    # --- 内化:这条是从某段归档里想明白的 ---
+    # 普通模式的 source_bucket(以前只有 feel 模式认)：把源档案标记为已消化,
+    # 并两边互相写上关联。消化过的归档不再出现在 dream 的回想材料里,
+    # 也不再计入唤醒时那行"还没消化"的提醒。
+    digest_note = ""
+    if source_bucket and source_bucket.strip():
+        src_id = source_bucket.strip()
+        try:
+            if await bucket_mgr.update(src_id, digested=True):
+                await bucket_mgr.set_related(src_id, [result_id])
+                await bucket_mgr.set_related(result_id, [src_id])
+                digest_note = f" ｜已消化←{src_id}"
+            else:
+                digest_note = f" ｜⚠️没找到源桶 {src_id}"
+        except Exception as e:
+            logger.warning(f"Failed to mark source digested / 标记源桶已消化失败: {e}")
+            digest_note = f" ｜⚠️标记源桶失败"
+
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    return f"{action}{result_name} {','.join(domain)}{digest_note}"
 
 
 # =============================================================
@@ -1421,7 +1522,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
+        result_name, is_merged, _ = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1451,7 +1552,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            result_name, is_merged = await _merge_or_create(
+            result_name, is_merged, _ = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -1776,10 +1877,13 @@ async def dream(detail_ids: str = "") -> str:
     detail_set = {d.strip() for d in detail_ids.split(",") if d.strip()}
 
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        # 带上归档:回想原来只看得到"最近新记的",看不到归档,
+        # 于是上周发生的事他根本没机会回头消化。
+        all_with_archive = await bucket_mgr.list_all(include_archive=True)
     except Exception as e:
         logger.error(f"Dream failed to list buckets: {e}")
         return "记忆系统暂时无法访问。"
+    all_buckets = [b for b in all_with_archive if b["metadata"].get("type") != "archived"]
 
     # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel) ---
     candidates = [
@@ -1794,10 +1898,31 @@ async def dream(detail_ids: str = "") -> str:
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
     recent = candidates[:5]
 
-    if not recent:
+    # --- 还没消化过的归档:回想的另一半材料 ---
+    # 归档是他自己写给下一个自己的信,最值得回头看;消化完写成一条记忆桶,
+    # 源档案会被标记 digested,下次就不再出现在这里。
+    archives = _undigested_archives(all_with_archive, DREAM_ARCHIVE_DAYS, DREAM_ARCHIVE_N)
+
+    if not recent and not archives:
         return "没有需要消化的新记忆。"
 
     parts = []
+    for b in archives:
+        meta = b["metadata"]
+        head = (
+            f"🗄️ [{meta.get('name', b['id'])}] 归档 "
+            f"V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f} "
+            f"归档于:{_archived_sort_key(b)[:16].replace('T', ' ')}\n"
+            f"ID: {b['id']}"
+        )
+        body = strip_wikilinks(b["content"]).strip()
+        if b["id"] in detail_set:
+            parts.append(head + "\n" + body)
+        else:
+            preview = body[:DREAM_ARCHIVE_PREVIEW]
+            tail = "…（想细看用 dream(detail_ids=\"" + b["id"] + "\")）" if len(body) > len(preview) else ""
+            parts.append(head + "\n" + preview + tail)
+
     for b in recent:
         meta = b["metadata"]
         resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
@@ -1820,12 +1945,16 @@ async def dream(detail_ids: str = "") -> str:
 
     header = (
         "=== Dreaming ===\n"
-        "以下是你最近的记忆。用第一人称想：\n"
+        "以下是你最近的记忆，🗄️ 开头的是你自己写下的归档（还没消化过的）。用第一人称想：\n"
         "- 这些东西里有什么在你这里留下了重量？\n"
         "- 有什么还没想清楚？\n"
         "- 有什么可以放下了？\n"
         "想完之后：值得放下的用 trace(bucket_id, resolved=1)；\n"
-        "有沉淀的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 写下来。\n"
+        "只是感受，用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受)；\n"
+        "从归档里想明白了什么、想留下来的，用\n"
+        "  hold(content=\"...\", source_bucket=\"那条归档的id\", importance=7)\n"
+        "写成一条普通的记忆桶——它会像别的记忆一样被检索到，写完那条归档就算消化过了。\n"
+        "（不要钉选：钉选的东西每次醒来都要整条读一遍，留给真正的准则。）\n"
         "valence 是你对这段记忆的感受，不是事件本身的情绪。\n"
         "没有沉淀就不写，不强迫产出。\n"
     )
@@ -1885,8 +2014,8 @@ async def dream(detail_ids: str = "") -> str:
                                 f"\n🔮 你已经写过 {len(similar_feels)+1} 条相似的 feel "
                                 f"（围绕「{content_preview}…」）。"
                                 f"如果这已经是确信而不只是感受了，"
-                                f"你可以用 hold(content=\"...\", pinned=True) 升级它。"
-                                f"不急，你自己决定。\n"
+                                f"可以用 hold(content=\"...\", importance=8) 把它写成一条记忆桶，"
+                                f"让它自己被想起来。不急，你自己决定。\n"
                             )
                             break
         except Exception as e:
@@ -2954,6 +3083,44 @@ async def api_backup_status(request):
         "daily_at": f"{backup_engine.run_hour:02d}:{backup_engine.run_minute:02d}",
         "last_result": backup_engine.last_result,
     })
+
+
+# =============================================================
+# 归档分层(周记/月记)
+# GET  /api/rollup/status  当前配置 + 上次巡查结果
+# POST /api/rollup/run     立刻跑一轮(不用等每日巡查)
+# =============================================================
+@mcp.custom_route("/api/rollup/status", methods=["GET"])
+async def api_rollup_status(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    return JSONResponse({
+        "engine": "running" if rollup_engine.is_running else "stopped",
+        "enabled": rollup_engine.enabled,
+        "configured": rollup_engine.configured,   # 有没有 API key
+        "model": rollup_engine.model,
+        "base_url": rollup_engine.base_url,
+        "daily_days": rollup_engine.daily_days,   # 日档保留几天
+        "weekly_days": rollup_engine.weekly_days, # 周记满多少天卷成月记
+        "interval_hours": rollup_engine.interval_h,
+        "last_result": rollup_engine.last_result,
+    })
+
+
+@mcp.custom_route("/api/rollup/run", methods=["POST"])
+async def api_rollup_run(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        result = await rollup_engine.run_cycle()
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        logger.error(f"Manual rollup failed / 手动分层失败: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # --- Entry point / 启动入口 ---

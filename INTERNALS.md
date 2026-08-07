@@ -130,6 +130,8 @@
 | `/api/trash` | DELETE | 清空回收站（不可恢复）🔒 |
 | `/api/trash/{id}/restore` | POST | 从回收站放回原目录 🔒 |
 | `/api/trash/{id}` | DELETE | 彻底删除某个回收站条目 🔒 |
+| `/api/rollup/status` | GET | 归档分层（周记/月记）配置与上次巡查结果 🔒 |
+| `/api/rollup/run` | POST | 立刻跑一轮分层，不等每日巡查 🔒 |
 | `/api/search?q=` | GET | 搜索 🔒 |
 | `/api/network` | GET | 向量相似网络 🔒 |
 | `/api/breath-debug` | GET | 评分调试 🔒 |
@@ -487,6 +489,22 @@ buckets/
 > `trash/` 不在 `_find_bucket_file` / `list_all` 的扫描目录里 —— 进了回收站的桶，
 > breath / search / 网络图 / decay 一律看不见，等于"想不起来了"，但文件还在，
 > 可以从面板放回原目录（frontmatter 里的 `trashed_from` 记着原路径）。
+
+### 内化与分层（2026-08-07）
+
+**内化**：`dream()` 现在除了最近新记的动态桶，还会带上「最近还没消化过的归档」
+（`digested` 不为真、`DREAM_ARCHIVE_DAYS` 天内、且没被卷进周记的）。他读完可以用
+`hold(content=..., source_bucket=<归档id>)` 写成一条**普通记忆桶**——普通模式的
+`source_bucket` 会把源档案标记 `digested=True` 并两边互写 `related`，那条归档随即
+从回想材料里消失。唤醒时若积压达到 `WAKE_DIGEST_HINT_MIN` 条，末尾附一行陈述式提醒
+（**不是指令**，见手册 §6 伪指令事故）。刻意不引导钉选：钉选桶每次唤醒全量浮现，
+是最贵的 token，留给真正的准则。
+
+**分层**：日档 7 天 → 周记 → 30 天 → 月记，见 `rollup_engine.py` 与 ENV_VARS.md。
+新增 frontmatter 字段：`rollup_kind`（week/month）、`rollup_period`（2026-W32 / 2026-08）、
+`rolled_up`（源档案被卷进了哪一层）、`rolled_into`（卷进了哪个桶）。这四个是系统记账，
+只能通过 `BucketManager.set_system_fields()` 写（不刷 `last_active`，不唤醒休眠桶），
+`update()` 的白名单里没有它们。
 
 桶文件格式：
 ```markdown
