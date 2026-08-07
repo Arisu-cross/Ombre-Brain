@@ -50,7 +50,9 @@ def _fake_client(text=TWO_EVENTS):
 @pytest.fixture
 def rollup_eng(test_config, bucket_mgr, mock_embedding_engine):
     from rollup_engine import RollupEngine
-    eng = RollupEngine(test_config, bucket_mgr, None, mock_embedding_engine)
+    # 分层默认是关的(opt-in),测试里显式打开
+    with patch.dict("os.environ", {"OMBRE_ROLLUP_ENABLED": "true"}, clear=False):
+        eng = RollupEngine(test_config, bucket_mgr, None, mock_embedding_engine)
     eng.client = _fake_client()
     return eng
 
@@ -239,7 +241,7 @@ async def test_no_api_key_skips_gracefully(test_config, bucket_mgr):
     from rollup_engine import RollupEngine
     cfg = dict(test_config)
     cfg["dehydration"] = {**test_config["dehydration"], "api_key": ""}
-    with patch.dict("os.environ", {"OMBRE_ROLLUP_API_KEY": ""}, clear=False):
+    with patch.dict("os.environ", {"OMBRE_ROLLUP_API_KEY": "", "OMBRE_ROLLUP_ENABLED": "true"}, clear=False):
         eng = RollupEngine(cfg, bucket_mgr)
     assert eng.configured is False
     assert (await eng.run_cycle()) == {"skipped": "no_api_key"}
@@ -251,6 +253,18 @@ async def test_disabled_by_env(test_config, bucket_mgr):
     with patch.dict("os.environ", {"OMBRE_ROLLUP_ENABLED": "false"}, clear=False):
         eng = RollupEngine(test_config, bucket_mgr)
     assert (await eng.run_cycle()) == {"skipped": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_off_by_default(test_config, bucket_mgr):
+    """默认必须是关的:线上脱水那把 key 是设了的,默认开 = 一部署就把全部历史卷完。"""
+    from rollup_engine import RollupEngine
+    env = {k: v for k, v in __import__("os").environ.items() if not k.startswith("OMBRE_ROLLUP")}
+    with patch.dict("os.environ", env, clear=True):
+        eng = RollupEngine(test_config, bucket_mgr)
+    assert eng.enabled is False
+    assert (await eng.run_cycle()) == {"skipped": "disabled"}
+    assert (await eng.run_cycle(dry_run=True)) == {"skipped": "disabled"}
 
 
 # ---------- 8. 只动归档,不碰普通记忆桶 ----------
@@ -346,7 +360,7 @@ async def test_dry_run_works_without_api_key(test_config, bucket_mgr):
     from rollup_engine import RollupEngine
     cfg = dict(test_config)
     cfg["dehydration"] = {**test_config["dehydration"], "api_key": ""}
-    with patch.dict("os.environ", {"OMBRE_ROLLUP_API_KEY": ""}, clear=False):
+    with patch.dict("os.environ", {"OMBRE_ROLLUP_API_KEY": "", "OMBRE_ROLLUP_ENABLED": "true"}, clear=False):
         eng = RollupEngine(cfg, bucket_mgr)
     base = now_local() - timedelta(days=now_local().weekday() + 14)
     await _archive_on(bucket_mgr, base)

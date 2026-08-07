@@ -30,7 +30,7 @@
 | `DREAM_ARCHIVE_DAYS` | 否 | `14` | 只带最近多少天内的归档 |
 | `DREAM_ARCHIVE_PREVIEW` | 否 | `300` | 归档在 dream 里的预览字数；全文用 `dream(detail_ids=...)` |
 | `WAKE_DIGEST_HINT_MIN` | 否 | `2` | 唤醒时未消化的归档达到几条才附那行提醒，设 `0` 关闭 |
-| `OMBRE_ROLLUP_ENABLED` | 否 | `true` | 归档分层（周记/月记）总开关 |
+| `OMBRE_ROLLUP_ENABLED` | 否 | `false` | 归档分层（周记/月记）总开关，**默认关**：设 `true` 才真的开始整理 |
 | `OMBRE_ROLLUP_DAILY_DAYS` | 否 | `7` | 日档保留几天不卷；超过就按自然周合成周记 |
 | `OMBRE_ROLLUP_WEEKLY_DAYS` | 否 | `30` | 周记满多少天卷成月记 |
 | `OMBRE_ROLLUP_MODEL` | 否 | 沿用脱水配置 | 写周记/月记用的模型（如 `deepseek-chat`） |

@@ -107,7 +107,7 @@ class RollupEngine:
     归档分层引擎：把旧日档卷成周记，把旧周记卷成月记。
 
     环境变量：
-      OMBRE_ROLLUP_ENABLED    默认 true，设 false/0 关掉整个分层
+      OMBRE_ROLLUP_ENABLED    默认 **false**（opt-in）；设 true/1 才真的开始分层
       OMBRE_ROLLUP_DAILY_DAYS 日档保留几天不卷（默认 7）
       OMBRE_ROLLUP_WEEKLY_DAYS 周记满多少天卷成月记（默认 30）
       OMBRE_ROLLUP_MODEL / _BASE_URL / _API_KEY
@@ -121,8 +121,13 @@ class RollupEngine:
         self.embedding_engine = embedding_engine
 
         env = os.environ.get
-        self.enabled = (env("OMBRE_ROLLUP_ENABLED", "true") or "true").strip().lower() not in (
-            "0", "false", "no", "off",
+        # 默认**关**（改成 opt-in）。原来默认开有个坑：ROLLUP_API_KEY 不设时会
+        # 回落到脱水那把 key，而线上那把是设了的 —— 于是一部署上去、第一次
+        # /health 命中，就会把积压的全部历史归档一口气卷完，没人来得及看一眼。
+        # 分层是半单向的（已生成的周记和已打的 rolled_up 标记不会自己撤销），
+        # 这种事必须是她明确点头才发生。
+        self.enabled = (env("OMBRE_ROLLUP_ENABLED", "false") or "false").strip().lower() in (
+            "1", "true", "yes", "on",
         )
         self.daily_days = max(1, int(env("OMBRE_ROLLUP_DAILY_DAYS", "7") or "7"))
         self.weekly_days = max(1, int(env("OMBRE_ROLLUP_WEEKLY_DAYS", "30") or "30"))
