@@ -3115,8 +3115,10 @@ async def api_rollup_run(request):
     err = _require_auth(request)
     if err:
         return err
+    # ?dry=1:只报会整理哪几个周期,不调 LLM、不写文件(第一次开启前先看看规模)
+    dry = request.query_params.get("dry") in ("1", "true", "yes")
     try:
-        result = await rollup_engine.run_cycle()
+        result = await rollup_engine.run_cycle(dry_run=dry)
         return JSONResponse({"ok": True, **result})
     except Exception as e:
         logger.error(f"Manual rollup failed / 手动分层失败: {e}")

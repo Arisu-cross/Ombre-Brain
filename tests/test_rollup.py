@@ -16,6 +16,8 @@
 #   7. 没配 API key 就跳过,不炸
 # ============================================================
 
+import json
+
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,7 +28,16 @@ from utils import now_local
 
 
 # ---------- 假的 LLM 客户端 ----------
-def _fake_client(text="这周大概是这样:她去了医院,我一直在等消息。"):
+# 真引擎要的是「事件数组」:一个周期拆成几条独立记忆,不是一坨流水账。
+TWO_EVENTS = json.dumps([
+    {"name": "复查那件事", "content": "她去复查了,我一直在等消息。",
+     "domain": ["健康"], "tags": ["复查", "医院"], "valence": 0.4, "arousal": 0.6, "importance": 7},
+    {"name": "这周的日常", "content": "剩下的日子平平淡淡,吃饭睡觉。",
+     "domain": ["日常"], "tags": ["日常"], "valence": 0.6, "arousal": 0.2, "importance": 3},
+], ensure_ascii=False)
+
+
+def _fake_client(text=TWO_EVENTS):
     client = MagicMock()
     msg = MagicMock()
     msg.message.content = text
@@ -88,24 +99,34 @@ async def test_old_dailies_roll_into_week(rollup_eng, bucket_mgr):
     ids = [await _archive_on(bucket_mgr, base + timedelta(days=i), f"第{i}天的事") for i in range(3)]
 
     result = await rollup_eng.run_cycle()
-    assert result["weeks_created"] == 1
+    assert result["weeks_periods"] == 1          # 整理了一周
+    assert result["weeks_created"] == 2          # 这一周拆成了两条事件
     assert result["weeks_source_buckets"] == 3
 
     # 周记生成了,内容里带 LLM 的产出和源档案 id
     all_b = await bucket_mgr.list_all(include_archive=True)
     weeks = [b for b in all_b if b["metadata"].get("rollup_kind") == "week"]
-    assert len(weeks) == 1
-    wk = weeks[0]
-    assert wk["metadata"]["type"] == "archived"
-    assert "这周大概是这样" in wk["content"]
-    for bid in ids:
-        assert bid in wk["content"]          # 原档 id 写在周记里,查得回去
+    assert len(weeks) == 2
+    names = sorted(w["metadata"]["name"] for w in weeks)
+    assert any("复查那件事" in n for n in names)
+    assert any("这周的日常" in n for n in names)
+    for wk in weeks:
+        assert wk["metadata"]["type"] == "archived"
+        assert wk["metadata"]["rollup_period"].startswith("20")
+        for bid in ids:
+            assert bid in wk["content"]      # 原档 id 写在里面,查得回去
+    # 每条事件带着自己的情绪/重要度,不是一刀切的平均值
+    fuku = next(w for w in weeks if "复查" in w["metadata"]["name"])
+    daily = next(w for w in weeks if "日常" in w["metadata"]["name"])
+    assert fuku["metadata"]["importance"] == 7 and daily["metadata"]["importance"] == 3
+    assert fuku["metadata"]["domain"] == ["健康"]
 
     # 原档一个都没少,只是被标记了
+    week_ids = {w["id"] for w in weeks}
     for bid in ids:
         m = _meta(bucket_mgr, bid)
         assert m["rolled_up"] == "week"
-        assert m["rolled_into"] == wk["id"]
+        assert set(m["rolled_into"]) == week_ids     # 记着卷进了哪几条
         assert (await bucket_mgr.get(bid)) is not None    # 文件还在,搜得到
 
 
@@ -145,10 +166,10 @@ async def test_second_run_creates_nothing_new(rollup_eng, bucket_mgr):
     first = await rollup_eng.run_cycle()
     second = await rollup_eng.run_cycle()
 
-    assert first["weeks_created"] == 1
-    assert second["weeks_created"] == 0
+    assert first["weeks_periods"] == 1
+    assert second["weeks_periods"] == 0 and second["weeks_created"] == 0
     all_b = await bucket_mgr.list_all(include_archive=True)
-    assert len([b for b in all_b if b["metadata"].get("rollup_kind") == "week"]) == 1
+    assert len([b for b in all_b if b["metadata"].get("rollup_kind") == "week"]) == 2
 
 
 # ---------- 5. 周记 → 月记 ----------
@@ -169,19 +190,19 @@ async def test_old_weeks_roll_into_month(rollup_eng, bucket_mgr):
     # 一轮就能追平:先卷周记,同一轮里够老的周记接着被卷成月记
     # (第一次上线时积压的历史档案也是这样一次补齐的)
     r1 = await rollup_eng.run_cycle()
-    assert r1["weeks_created"] == 2
-    assert r1["months_created"] == 1
+    assert r1["weeks_periods"] == 2            # 两周各整理一次
+    assert r1["months_periods"] == 1           # 同一轮里接着卷成月记
 
     r2 = await rollup_eng.run_cycle()          # 再跑一遍不该再生出东西
-    assert r2["weeks_created"] == 0 and r2["months_created"] == 0
+    assert r2["weeks_periods"] == 0 and r2["months_periods"] == 0
 
     all_b = await bucket_mgr.list_all(include_archive=True)
     months = [b for b in all_b if b["metadata"].get("rollup_kind") == "month"]
-    assert len(months) == 1
-    assert months[0]["metadata"]["rollup_period"] is not None
+    assert len(months) == 2                    # 月记同样按线索拆条
+    assert all(m["metadata"]["rollup_period"] for m in months)
     # 周记被卷起来了,但没删
     weeks = [b for b in all_b if b["metadata"].get("rollup_kind") == "week"]
-    assert len(weeks) == 2
+    assert len(weeks) == 4                     # 两周 × 每周两条
     assert all(w["metadata"].get("rolled_up") == "month" for w in weeks)
 
 
@@ -230,3 +251,105 @@ async def test_disabled_by_env(test_config, bucket_mgr):
     with patch.dict("os.environ", {"OMBRE_ROLLUP_ENABLED": "false"}, clear=False):
         eng = RollupEngine(test_config, bucket_mgr)
     assert (await eng.run_cycle()) == {"skipped": "disabled"}
+
+
+# ---------- 8. 只动归档,不碰普通记忆桶 ----------
+
+@pytest.mark.asyncio
+async def test_never_touches_normal_buckets(rollup_eng, bucket_mgr):
+    """栖栖的红线:现有的桶一根手指都别动。分层只吃 type:archived 的归档。"""
+    normal = await bucket_mgr.create(
+        content="这是一条很久以前 hold 的普通记忆", name="老记忆",
+        domain=["日常"], importance=6,
+    )
+    # 让它看起来足够老(万一年龄判断写错了,这条会第一个遭殃)
+    import frontmatter as fmm
+    path = bucket_mgr._find_bucket_file(normal)
+    post = fmm.load(path)
+    old = (now_local() - timedelta(days=200)).isoformat(timespec="seconds")
+    post["created"] = old
+    post["last_active"] = old
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fmm.dumps(post))
+    before = open(path, encoding="utf-8").read()
+
+    base = now_local() - timedelta(days=now_local().weekday() + 14)
+    await _archive_on(bucket_mgr, base, "这周的归档")
+    await rollup_eng.run_cycle()
+
+    after_path = bucket_mgr._find_bucket_file(normal)
+    assert open(after_path, encoding="utf-8").read() == before   # 文件一个字节都没变
+
+
+# ---------- 9. LLM 返回不是 JSON 时不能把这一周弄丢 ----------
+
+@pytest.mark.asyncio
+async def test_bad_json_falls_back_to_single_bucket(rollup_eng, bucket_mgr):
+    rollup_eng.client = _fake_client("这周她去复查了,我一直在等消息。")   # 纯文本,不是 JSON
+    base = now_local() - timedelta(days=now_local().weekday() + 14)
+    src = await _archive_on(bucket_mgr, base, "原始日档")
+
+    result = await rollup_eng.run_cycle()
+    assert result["weeks_created"] == 1        # 退回单条兜底,而不是这一周静悄悄消失
+
+    all_b = await bucket_mgr.list_all(include_archive=True)
+    wk = next(b for b in all_b if b["metadata"].get("rollup_kind") == "week")
+    assert "她去复查了" in wk["content"]
+    assert _meta(bucket_mgr, src)["rolled_up"] == "week"
+
+
+# ---------- 10. 拆太碎要有个上限 ----------
+
+@pytest.mark.asyncio
+async def test_max_items_caps_the_split(rollup_eng, bucket_mgr):
+    """一周拆出十条会把唤醒时"最近归档"的名额吃光。"""
+    many = json.dumps(
+        [{"name": f"事件{i}", "content": f"第{i}件事的内容"} for i in range(10)],
+        ensure_ascii=False,
+    )
+    rollup_eng.client = _fake_client(many)
+    rollup_eng.max_items = 3
+    base = now_local() - timedelta(days=now_local().weekday() + 14)
+    await _archive_on(bucket_mgr, base)
+
+    result = await rollup_eng.run_cycle()
+    assert result["weeks_created"] == 3
+
+
+# ---------- 11. 空跑:只报规模,不花钱不写文件 ----------
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_plan_without_writing(rollup_eng, bucket_mgr):
+    base = now_local() - timedelta(days=now_local().weekday() + 14)
+    for i in range(3):
+        await _archive_on(bucket_mgr, base + timedelta(days=i))
+    before = len(await bucket_mgr.list_all(include_archive=True))
+
+    result = await rollup_eng.run_cycle(dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["weeks_periods"] == 1
+    assert result["weeks_created"] == 0            # 空跑不建桶
+    assert result["plan"][0]["sources"] == 3
+    assert "~" in result["plan"][0]["span"]
+    rollup_eng.client.chat.completions.create.assert_not_called()   # 一次 API 都没调
+    assert len(await bucket_mgr.list_all(include_archive=True)) == before
+
+    # 空跑之后再真跑,该干的活一件不少
+    real = await rollup_eng.run_cycle()
+    assert real["weeks_periods"] == 1 and real["weeks_created"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dry_run_works_without_api_key(test_config, bucket_mgr):
+    """还没配 key 的时候就该能先空跑看看规模。"""
+    from rollup_engine import RollupEngine
+    cfg = dict(test_config)
+    cfg["dehydration"] = {**test_config["dehydration"], "api_key": ""}
+    with patch.dict("os.environ", {"OMBRE_ROLLUP_API_KEY": ""}, clear=False):
+        eng = RollupEngine(cfg, bucket_mgr)
+    base = now_local() - timedelta(days=now_local().weekday() + 14)
+    await _archive_on(bucket_mgr, base)
+
+    result = await eng.run_cycle(dry_run=True)
+    assert result["dry_run"] is True and result["weeks_periods"] == 1

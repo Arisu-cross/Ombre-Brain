@@ -36,7 +36,8 @@
 | `OMBRE_ROLLUP_MODEL` | 否 | 沿用脱水配置 | 写周记/月记用的模型（如 `deepseek-chat`） |
 | `OMBRE_ROLLUP_BASE_URL` | 否 | 沿用脱水配置 | 写周记/月记的 API 地址（如 `https://api.deepseek.com/v1`） |
 | `OMBRE_ROLLUP_API_KEY` | 否 | 沿用脱水配置 | 写周记/月记的 Key；三个都不设就跟脱水走同一家 |
-| `OMBRE_ROLLUP_MAX_TOKENS` | 否 | `1500` | 单条周记/月记的生成上限 |
+| `OMBRE_ROLLUP_MAX_TOKENS` | 否 | `2048` | 单次整理的生成上限 |
+| `OMBRE_ROLLUP_MAX_ITEMS` | 否 | `5` | 一个周期最多拆成几条（拆太碎会吃光唤醒时"最近归档"的名额） |
 | `OMBRE_ROLLUP_INTERVAL_H` | 否 | `24` | 分层巡查间隔（小时） |
 | `OMBRE_BACKUP_GIT_NAME` | 否 | `Ombre Brain Backup` | 备份 commit 的 author name |
 | `OMBRE_BACKUP_GIT_EMAIL` | 否 | `ombre-backup@users.noreply.github.com` | 备份 commit 的 author email |
@@ -58,14 +59,21 @@
 | 年龄 | 呈现 |
 |---|---|
 | 最近 7 天 | 日档原样浮现 |
-| 超过 7 天 | 按自然周（周一~周日）合成一条「周记 YYYY-Www」 |
-| 周记超过 30 天 | 按月合成一条「月记 YYYY-MM」 |
+| 超过 7 天 | 这一周**按事件拆成几条**「周记 YYYY-Www - 某件事」 |
+| 周记超过 30 天 | 这个月**按线索拆成几条**「月记 YYYY-MM - 某条线」 |
+
+**为什么是几条不是一条**：一坨流水账没法被单独想起来。拆成事件之后，「上个月复查那件事」
+和「上个月工作那摊」各是一条记忆，检索才找得准。这些桶都是**直接新建**的，
+不走 `hold` 的合并判定 —— 不受 `merge_threshold` 影响。
 
 - **原档永远保留**，只是打上 `rolled_up` 标记后不再单独浮现；搜索照样搜得到，
   周记/月记正文里也写着源档案的 id，随时能查回去。
 - 只卷**已经结束**的周期（本周没过完不会提前封盘），同一轮里可以级联
   （日档 → 周记 → 月记），首次上线时积压的历史档案一次补齐。
-- 手动触发：`POST /api/rollup/run`；查看状态：`GET /api/rollup/status`（都需认证）。
+- **只吃 `type: archived` 的归档**，普通记忆桶（`hold` 写的）完全不在扫描范围内。
+- 手动触发：`POST /api/rollup/run`；**空跑**：`POST /api/rollup/run?dry=1`
+  （只报会整理哪几个周期、各吃几份原料，**不调 LLM、不写文件**，没配 key 也能跑）；
+  查看状态：`GET /api/rollup/status`。都需认证。
 - 想让它单独走另一家模型（例如周记/月记走 DeepSeek，脱水仍走原来的），设
   `OMBRE_ROLLUP_MODEL` / `_BASE_URL` / `_API_KEY` 三个即可；不设就沿用脱水配置。
 

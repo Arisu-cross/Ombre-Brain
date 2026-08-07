@@ -131,7 +131,7 @@
 | `/api/trash/{id}/restore` | POST | 从回收站放回原目录 🔒 |
 | `/api/trash/{id}` | DELETE | 彻底删除某个回收站条目 🔒 |
 | `/api/rollup/status` | GET | 归档分层（周记/月记）配置与上次巡查结果 🔒 |
-| `/api/rollup/run` | POST | 立刻跑一轮分层，不等每日巡查 🔒 |
+| `/api/rollup/run` | POST | 立刻跑一轮分层；`?dry=1` 空跑只报规模不写文件 🔒 |
 | `/api/search?q=` | GET | 搜索 🔒 |
 | `/api/network` | GET | 向量相似网络 🔒 |
 | `/api/breath-debug` | GET | 评分调试 🔒 |
@@ -500,7 +500,9 @@ buckets/
 （**不是指令**，见手册 §6 伪指令事故）。刻意不引导钉选：钉选桶每次唤醒全量浮现，
 是最贵的 token，留给真正的准则。
 
-**分层**：日档 7 天 → 周记 → 30 天 → 月记，见 `rollup_engine.py` 与 ENV_VARS.md。
+**分层**：日档 7 天 → 周记 → 30 天 → 月记，且**每个周期按事件拆成 1~N 条**
+（一坨流水账没法被单独想起来）。只吃 `type: archived` 的归档，普通桶不碰；
+产物直接 `create()`，不走合并判定。见 `rollup_engine.py` 与 ENV_VARS.md。
 新增 frontmatter 字段：`rollup_kind`（week/month）、`rollup_period`（2026-W32 / 2026-08）、
 `rolled_up`（源档案被卷进了哪一层）、`rolled_into`（卷进了哪个桶）。这四个是系统记账，
 只能通过 `BucketManager.set_system_fields()` 写（不刷 `last_active`，不唤醒休眠桶），
