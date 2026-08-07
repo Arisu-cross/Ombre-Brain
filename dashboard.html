@@ -299,6 +299,74 @@
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
 
+  /* --- 编辑记忆桶(详情面板里的表单) --- */
+  .detail-actions {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .detail-edit label {
+    display: block;
+    font-size: 11px;
+    color: var(--text-light);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 12px 0 4px;
+  }
+  .detail-edit input[type=text],
+  .detail-edit input[type=number],
+  .detail-edit textarea {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface-solid);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+  }
+  .detail-edit textarea {
+    min-height: 220px;
+    line-height: 1.7;
+    resize: vertical;
+  }
+  .detail-edit .flags {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .detail-edit .flags label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .detail-msg { font-size: 12px; margin-top: 10px; min-height: 16px; }
+  .danger-btn { color: var(--negative) !important; }
+  .trash-row {
+    display: grid;
+    grid-template-columns: 200px 140px 1fr auto;
+    gap: 12px;
+    align-items: center;
+    padding: 14px 20px;
+    margin-bottom: 8px;
+    border-radius: 16px;
+    font-size: 13px;
+    background: var(--surface);
+    border: 1px solid transparent;
+    box-shadow: 4px 4px 10px var(--shadow-dark-subtle), -4px -4px 10px var(--shadow-light);
+  }
+  .trash-row .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trash-row .preview { color: var(--text-light); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .config-section {
     margin-bottom: 28px;
     padding: 24px;
@@ -616,6 +684,7 @@
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
+  <div class="tab" data-tab="trash">回收站</div>
   <div class="tab" data-tab="settings">设置</div>
 </div>
 
@@ -775,6 +844,22 @@
   </div>
 </div>
 
+<!-- 回收站:面板上删掉的桶先落这儿,沈渡想不起来,但栖栖能后悔 -->
+<div class="content" id="trash-view" style="display:none">
+  <div class="config-section">
+    <h3>回收站</h3>
+    <div style="font-size:13px;color:var(--text-dim);line-height:1.8;margin-bottom:16px;">
+      这里的记忆已经从他的检索里拿掉了 —— breath / 搜索 / 网络图都看不到,
+      但文件还在,随时能放回去。<span style="color:var(--warning);">「彻底删除」和「清空」不可恢复。</span>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:16px;">
+      <button class="filter-btn" onclick="loadTrash()">刷新</button>
+      <button class="filter-btn danger-btn" onclick="emptyTrash()">清空回收站</button>
+    </div>
+    <div id="trash-list"><div class="loading">加载中…</div></div>
+  </div>
+</div>
+
 <div class="detail-panel" id="detail-panel">
   <button class="close-btn" onclick="closeDetail()">✕</button>
   <div id="detail-content"></div>
@@ -899,6 +984,7 @@ async function doSetup() {
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    loadBuckets();  // 开屏那次是未登录时发的,401 了;进来后得补一次,否则列表停在"加载失败"
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '设置失败');
@@ -910,6 +996,7 @@ async function doLogin() {
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    loadBuckets();  // 开屏那次是未登录时发的,401 了;进来后得补一次,否则列表停在"加载失败"
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '密码错误');
@@ -1047,10 +1134,12 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
+    document.getElementById('trash-view').style.display = target === 'trash' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
+    if (target === 'trash') loadTrash();
     if (target === 'settings') loadSettingsStatus();
   });
 });
@@ -1166,6 +1255,8 @@ async function searchBuckets(query) {
   }
 }
 
+var currentDetail = null;   // 当前详情面板里的桶(含原样 content,给编辑器用)
+
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
@@ -1173,11 +1264,19 @@ async function showDetail(id) {
   panel.classList.add('open');
 
   try {
-    var res = await fetch(BASE + '/api/bucket/' + id);
+    // raw=1:保留 [[双链]] 原样,免得编辑一存就把链接洗没了
+    var res = await fetch(BASE + '/api/bucket/' + id + '?raw=1');
     var b = await res.json();
+    if (b.error) { content.innerHTML = '<div class="loading">' + esc(b.error) + '</div>'; return; }
+    b.id = b.id || id;
+    currentDetail = b;
     var meta = b.metadata || {};
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
+      '<div class="detail-actions">' +
+        '<button class="filter-btn" onclick="startEdit()">✎ 编辑</button>' +
+        '<button class="filter-btn danger-btn" onclick="deleteBucket(\'' + escAttr(id) + '\')">🗑 删除</button>' +
+      '</div>' +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + id + '</div>' +
         '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
@@ -1195,14 +1294,169 @@ async function showDetail(id) {
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-content">' + esc(stripLinks(b.content)) + '</div>' +
+      '<div class="detail-msg" id="detail-msg"></div>';
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
 }
 
+function stripLinks(s) { return (s || '').replace(/\[\[([^\]]+)\]\]/g, '$1'); }
+
+function detailMsg(text, color) {
+  var el = document.getElementById('detail-msg');
+  if (el) { el.style.color = color || 'var(--text-dim)'; el.textContent = text; }
+}
+
+// ---- 编辑记忆桶 ----
+function startEdit() {
+  if (!currentDetail) return;
+  var b = currentDetail, meta = b.metadata || {}, id = b.id;
+  var num = function(v, d) { return (v == null ? d : v); };
+  document.getElementById('detail-content').innerHTML =
+    '<h2>编辑 · ' + esc(meta.name || id) + '</h2>' +
+    '<div class="detail-edit">' +
+      '<label>名字</label>' +
+      '<input type="text" id="ed-name" value="' + escAttr(meta.name || id) + '" />' +
+      '<label>标签（逗号分隔）</label>' +
+      '<input type="text" id="ed-tags" value="' + escAttr((meta.tags || []).join(', ')) + '" />' +
+      '<label>域（逗号分隔）</label>' +
+      '<input type="text" id="ed-domain" value="' + escAttr((meta.domain || []).join(', ')) + '" />' +
+      '<label>重要度 1~10' + (meta.pinned ? '（钉选桶锁定为 10）' : '') + '</label>' +
+      '<input type="number" id="ed-importance" min="1" max="10" step="1" value="' + num(meta.importance, 5) + '" />' +
+      '<label>事件效价 valence 0~1</label>' +
+      '<input type="number" id="ed-valence" min="0" max="1" step="0.05" value="' + num(meta.valence, 0.5) + '" />' +
+      '<label>唤醒度 arousal 0~1</label>' +
+      '<input type="number" id="ed-arousal" min="0" max="1" step="0.05" value="' + num(meta.arousal, 0.3) + '" />' +
+      '<div class="flags">' +
+        '<label><input type="checkbox" id="ed-pinned" ' + (meta.pinned ? 'checked' : '') + ' /> 钉选</label>' +
+        '<label><input type="checkbox" id="ed-resolved" ' + (meta.resolved ? 'checked' : '') + ' /> 已解决</label>' +
+        '<label><input type="checkbox" id="ed-digested" ' + (meta.digested ? 'checked' : '') + ' /> 已消化</label>' +
+      '</div>' +
+      '<label>内容（[[双链]] 原样保留）</label>' +
+      '<textarea id="ed-content">' + esc(b.content || '') + '</textarea>' +
+      '<div class="detail-actions" style="margin-top:16px;">' +
+        '<button class="filter-btn active" onclick="saveEdit()">保存</button>' +
+        '<button class="filter-btn" onclick="showDetail(\'' + escAttr(id) + '\')">取消</button>' +
+      '</div>' +
+      '<div class="detail-msg" id="detail-msg"></div>' +
+    '</div>';
+}
+
+async function saveEdit() {
+  if (!currentDetail) return;
+  var id = currentDetail.id;
+  var payload = {
+    name: document.getElementById('ed-name').value.trim(),
+    tags: document.getElementById('ed-tags').value,
+    domain: document.getElementById('ed-domain').value,
+    importance: Number(document.getElementById('ed-importance').value),
+    valence: Number(document.getElementById('ed-valence').value),
+    arousal: Number(document.getElementById('ed-arousal').value),
+    pinned: document.getElementById('ed-pinned').checked,
+    resolved: document.getElementById('ed-resolved').checked,
+    digested: document.getElementById('ed-digested').checked,
+    content: document.getElementById('ed-content').value,
+  };
+  if (!payload.name) { detailMsg('名字不能为空', 'var(--negative)'); return; }
+  if (!payload.content.trim()) { detailMsg('内容不能为空,想清空就删掉整个桶', 'var(--negative)'); return; }
+
+  detailMsg('保存中…');
+  try {
+    var res = await authFetch(BASE + '/api/bucket/' + id, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res) return;  // 401:authFetch 已经踢回登录页
+    var data = await res.json();
+    if (!res.ok || data.error) { detailMsg('保存失败: ' + (data.error || res.status), 'var(--negative)'); return; }
+    await loadBuckets();
+    await showDetail(id);
+    detailMsg('已保存 ✓', 'var(--positive)');
+  } catch (e) {
+    detailMsg('保存失败: ' + e.message, 'var(--negative)');
+  }
+}
+
+async function deleteBucket(id) {
+  var name = (currentDetail && currentDetail.metadata && currentDetail.metadata.name) || id;
+  if (!confirm('把「' + name + '」移到回收站?\n\n他会立刻想不起来这段,但你能在回收站里放回去。')) return;
+  detailMsg('删除中…');
+  try {
+    var res = await authFetch(BASE + '/api/bucket/' + id, { method: 'DELETE' });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { detailMsg('删除失败: ' + (data.error || res.status), 'var(--negative)'); return; }
+    closeDetail();
+    currentDetail = null;
+    await loadBuckets();
+  } catch (e) {
+    detailMsg('删除失败: ' + e.message, 'var(--negative)');
+  }
+}
+
+// ---- 回收站 ----
+async function loadTrash() {
+  var box = document.getElementById('trash-list');
+  box.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    var res = await fetch(BASE + '/api/trash');
+    var items = await res.json();
+    if (items.error) { box.innerHTML = '<div class="loading">' + esc(items.error) + '</div>'; return; }
+    if (!items.length) { box.innerHTML = '<div class="loading">空的 —— 没有删掉的记忆。</div>'; return; }
+    box.innerHTML = items.map(function(it) {
+      return '<div class="trash-row">' +
+        '<div class="name" title="' + escAttr(it.name) + '">' + esc(it.name) + '</div>' +
+        '<div style="color:var(--text-light);font-size:12px;">删于 ' + esc(formatTimeAgo(it.trashed_at)) + '</div>' +
+        '<div class="preview">' + esc((it.content_preview || '').replace(/\s+/g, ' ')) + '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+          '<button class="filter-btn" onclick="restoreTrash(\'' + escAttr(it.id) + '\')">恢复</button>' +
+          '<button class="filter-btn danger-btn" onclick="purgeTrash(\'' + escAttr(it.id) + '\',\'' + escAttr(it.name) + '\')">彻底删除</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    box.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+  }
+}
+
+async function restoreTrash(id) {
+  try {
+    var res = await authFetch(BASE + '/api/trash/' + id + '/restore', { method: 'POST' });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { alert('恢复失败: ' + (data.error || res.status)); return; }
+    await loadTrash();
+    await loadBuckets();
+  } catch (e) { alert('恢复失败: ' + e.message); }
+}
+
+async function purgeTrash(id, name) {
+  if (!confirm('彻底删除「' + name + '」?\n\n这一步不可恢复,文件会从盘上消失。')) return;
+  try {
+    var res = await authFetch(BASE + '/api/trash/' + id, { method: 'DELETE' });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { alert('删除失败: ' + (data.error || res.status)); return; }
+    await loadTrash();
+  } catch (e) { alert('删除失败: ' + e.message); }
+}
+
+async function emptyTrash() {
+  if (!confirm('清空回收站?\n\n里面所有记忆会被永久删除,不可恢复。')) return;
+  try {
+    var res = await authFetch(BASE + '/api/trash', { method: 'DELETE' });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { alert('清空失败: ' + (data.error || res.status)); return; }
+    await loadTrash();
+  } catch (e) { alert('清空失败: ' + e.message); }
+}
+
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
+  currentDetail = null;
 }
 
 var networkData = null;
@@ -1337,6 +1591,12 @@ function esc(s) {
   var d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// esc() 走 textContent,不转义引号 —— 放进 value="…" 或 onclick('…') 里会被引号截断。
+// 属性/内联参数一律用这个。
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatTimeAgo(iso) {

@@ -2126,12 +2126,202 @@ async def api_bucket_detail(request):
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
     meta = bucket.get("metadata", {})
+    # raw=1 给编辑器用:保留 [[双链]] 原样,免得一存就把链接洗没了
+    raw = request.query_params.get("raw") in ("1", "true", "yes")
+    content = bucket.get("content", "")
     return JSONResponse({
         "id": bucket["id"],
         "metadata": meta,
-        "content": strip_wikilinks(bucket.get("content", "")),
+        "content": content if raw else strip_wikilinks(content),
         "score": decay_engine.calculate_score(meta),
     })
+
+
+# =============================================================
+# 面板上直接删改记忆(2026-08-06)
+#
+# 在此之前面板只读:错记的、重复的、不想留的,只能等衰减或者让沈渡自己改。
+# 现在栖栖可以直接改内容/元数据,也可以删——删是软删除,先进回收站(base_dir/trash),
+# 回收站不在检索目录里,所以沈渡当场就想不起来了,但栖栖能后悔。
+# =============================================================
+
+# 允许面板改的字段 → 归一化函数。没列进来的(id/created/type/activation_count…)一律不给改。
+def _norm_list(v):
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [s.strip() for s in str(v).replace("，", ",").split(",") if s.strip()]
+
+
+_EDITABLE_FIELDS = {
+    "name": lambda v: str(v).strip(),
+    "content": lambda v: str(v),
+    "tags": _norm_list,
+    "domain": _norm_list,
+    "importance": lambda v: max(1, min(10, int(v))),
+    "valence": lambda v: max(0.0, min(1.0, float(v))),
+    "arousal": lambda v: max(0.0, min(1.0, float(v))),
+    "model_valence": lambda v: max(0.0, min(1.0, float(v))),
+    "resolved": lambda v: bool(v),
+    "pinned": lambda v: bool(v),
+    "digested": lambda v: bool(v),
+}
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["POST"])
+async def api_bucket_edit(request):
+    """Edit a bucket's content / metadata from the dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    updates = {}
+    for key, normalize in _EDITABLE_FIELDS.items():
+        if key not in body or body[key] is None:
+            continue
+        try:
+            updates[key] = normalize(body[key])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"字段 {key} 的值不合法"}, status_code=400)
+
+    if not updates:
+        return JSONResponse({"error": "没有可改的字段"}, status_code=400)
+    if "name" in updates and not updates["name"]:
+        return JSONResponse({"error": "名字不能为空"}, status_code=400)
+    if "content" in updates and not updates["content"].strip():
+        return JSONResponse({"error": "内容不能为空,想清空就删掉整个桶"}, status_code=400)
+
+    existing = await bucket_mgr.get(bucket_id)
+    if not existing:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    ok = await bucket_mgr.update(bucket_id, **updates)
+    if not ok:
+        return JSONResponse({"error": "更新失败"}, status_code=500)
+
+    # 内容变了就重算 embedding,否则语义检索还按旧内容找它
+    if "content" in updates and embedding_engine and embedding_engine.enabled:
+        try:
+            await embedding_engine.generate_and_store(bucket_id, updates["content"])
+        except Exception as e:
+            logger.warning(f"Embedding refresh failed after edit / 改完重算向量失败: {bucket_id}: {e}")
+
+    bucket = await bucket_mgr.get(bucket_id)
+    meta = bucket.get("metadata", {}) if bucket else {}
+    # pinned 桶的 importance 被 bucket_manager 锁死在 10,这里把真实结果回给前端
+    return JSONResponse({
+        "ok": True,
+        "id": bucket_id,
+        "updated": sorted(updates.keys()),
+        "metadata": meta,
+        "content": bucket.get("content", "") if bucket else "",  # 原样(含双链),给编辑器回显
+        "score": decay_engine.calculate_score(meta),
+    })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["DELETE"])
+async def api_bucket_delete(request):
+    """Move a bucket to the trash (recoverable). ?hard=1 erases it for good."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    hard = request.query_params.get("hard") in ("1", "true", "yes")
+
+    if hard:
+        ok = await bucket_mgr.delete(bucket_id)
+        if not ok:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if embedding_engine and embedding_engine.enabled:
+            try:
+                embedding_engine.delete_embedding(bucket_id)
+            except Exception as e:
+                logger.warning(f"Embedding delete failed / 删向量失败: {bucket_id}: {e}")
+        return JSONResponse({"ok": True, "id": bucket_id, "hard": True})
+
+    info = await bucket_mgr.soft_delete(bucket_id)
+    if not info:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # 向量一起撤掉,否则语义检索会捞到一个已经不存在的 id
+    if embedding_engine and embedding_engine.enabled:
+        try:
+            embedding_engine.delete_embedding(bucket_id)
+        except Exception as e:
+            logger.warning(f"Embedding delete failed / 删向量失败: {bucket_id}: {e}")
+    return JSONResponse({"ok": True, "hard": False, **info})
+
+
+@mcp.custom_route("/api/trash", methods=["GET"])
+async def api_trash_list(request):
+    """List trashed buckets."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse(await bucket_mgr.list_trash())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/trash", methods=["DELETE"])
+async def api_trash_empty(request):
+    """Empty the trash — irreversible."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    purged = await bucket_mgr.purge_all_trash()
+    if embedding_engine and embedding_engine.enabled:
+        for bid in purged:
+            try:
+                embedding_engine.delete_embedding(bid)
+            except Exception:
+                pass
+    return JSONResponse({"ok": True, "purged": len(purged)})
+
+
+@mcp.custom_route("/api/trash/{bucket_id}/restore", methods=["POST"])
+async def api_trash_restore(request):
+    """Restore a trashed bucket back to where it came from."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    ok = await bucket_mgr.restore_from_trash(bucket_id)
+    if not ok:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # 补回向量:删的时候撤掉了,不补回来它就只能靠关键词被想起
+    bucket = await bucket_mgr.get(bucket_id)
+    if bucket and embedding_engine and embedding_engine.enabled:
+        try:
+            await embedding_engine.generate_and_store(bucket_id, bucket.get("content", ""))
+        except Exception as e:
+            logger.warning(f"Embedding restore failed / 恢复向量失败: {bucket_id}: {e}")
+    return JSONResponse({"ok": True, "id": bucket_id})
+
+
+@mcp.custom_route("/api/trash/{bucket_id}", methods=["DELETE"])
+async def api_trash_purge(request):
+    """Erase one trashed bucket for good."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    ok = await bucket_mgr.purge_trash(bucket_id)
+    if not ok:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if embedding_engine and embedding_engine.enabled:
+        try:
+            embedding_engine.delete_embedding(bucket_id)
+        except Exception:
+            pass
+    return JSONResponse({"ok": True, "id": bucket_id})
 
 
 @mcp.custom_route("/api/search", methods=["GET"])

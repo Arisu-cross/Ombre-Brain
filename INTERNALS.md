@@ -123,7 +123,13 @@
 | `/dream-hook` | GET | Dream 钩子（端点保留；SessionStart 钩子不再自动调用，唤醒不做梦） |
 | `/dashboard` | GET | Dashboard 页面 |
 | `/api/buckets` | GET | 桶列表 🔒 |
-| `/api/bucket/{id}` | GET | 桶详情 🔒 |
+| `/api/bucket/{id}` | GET | 桶详情（`?raw=1` 保留 `[[双链]]`，编辑器用）🔒 |
+| `/api/bucket/{id}` | POST | 面板编辑：改内容/名字/标签/域/重要度/valence/arousal/pinned/resolved/digested，其余字段不可改 🔒 |
+| `/api/bucket/{id}` | DELETE | 移入回收站（可恢复）；`?hard=1` 直接物理删除 🔒 |
+| `/api/trash` | GET | 回收站列表 🔒 |
+| `/api/trash` | DELETE | 清空回收站（不可恢复）🔒 |
+| `/api/trash/{id}/restore` | POST | 从回收站放回原目录 🔒 |
+| `/api/trash/{id}` | DELETE | 彻底删除某个回收站条目 🔒 |
 | `/api/search?q=` | GET | 搜索 🔒 |
 | `/api/network` | GET | 向量相似网络 🔒 |
 | `/api/breath-debug` | GET | 评分调试 🔒 |
@@ -474,8 +480,13 @@ buckets/
 │   ├── 数字/
 │   └── ...
 ├── archive/         # 衰减归档桶
-└── feel/            # 模型自省 feel 桶
+├── feel/            # 模型自省 feel 桶
+└── trash/           # 回收站：面板删掉的桶（不参与检索/衰减/备份，可恢复）
 ```
+
+> `trash/` 不在 `_find_bucket_file` / `list_all` 的扫描目录里 —— 进了回收站的桶，
+> breath / search / 网络图 / decay 一律看不见，等于"想不起来了"，但文件还在，
+> 可以从面板放回原目录（frontmatter 里的 `trashed_from` 记着原路径）。
 
 桶文件格式：
 ```markdown
