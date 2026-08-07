@@ -72,6 +72,9 @@ def _find_existing(buckets_dir: str, bucket_id: str) -> str | None:
         # 跳过备份仓库工作区等隐藏目录
         if os.sep + "." in root + os.sep:
             continue
+        # 跳过回收站：删掉的桶不算"既有文件"，否则恢复会把内容写回回收站里
+        if os.path.basename(root) == "trash" or (os.sep + "trash" + os.sep) in root + os.sep:
+            continue
         for fn in files:
             if not fn.endswith(".md"):
                 continue

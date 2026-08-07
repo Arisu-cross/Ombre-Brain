@@ -59,6 +59,9 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        # 回收站：面板上"删除"的桶先挪到这里，不在检索目录里（_find_bucket_file /
+        # list_all 都不扫它），所以沈渡再也想不起来；但文件还在，能后悔。
+        self.trash_dir = os.path.join(self.base_dir, "trash")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -475,6 +478,154 @@ class BucketManager:
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True
+
+    # ---------------------------------------------------------
+    # Trash / 回收站
+    #
+    # 面板上的"删除"走软删除：桶文件挪进 base_dir/trash/，并在
+    # frontmatter 里记下原始相对路径(trashed_from)和时刻(trashed_at)。
+    # trash 不在 _find_bucket_file / list_all 的扫描目录里，所以对
+    # breath/search/decay 而言这个桶已经不存在；但文件还在，能恢复。
+    # 手册红线：宁可留着，绝不误删记忆。
+    # ---------------------------------------------------------
+    def _trash_path_for(self, filename: str) -> str:
+        """回收站里的落点，重名就加 -1 -2 …（同一天删两个同名桶也不会互相盖）"""
+        target = os.path.join(self.trash_dir, filename)
+        if not os.path.exists(target):
+            return target
+        stem, ext = os.path.splitext(filename)
+        n = 1
+        while os.path.exists(os.path.join(self.trash_dir, f"{stem}-{n}{ext}")):
+            n += 1
+        return os.path.join(self.trash_dir, f"{stem}-{n}{ext}")
+
+    async def soft_delete(self, bucket_id: str) -> Optional[dict]:
+        """
+        Move a bucket into the trash instead of erasing it.
+        把桶挪进回收站（可恢复），返回它的简要信息；找不到返回 None。
+        """
+        async with self._lock_for(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return None
+            try:
+                post = frontmatter.load(file_path)
+                rel = os.path.relpath(file_path, self.base_dir)
+                post["trashed_from"] = rel
+                post["trashed_at"] = now_iso()
+
+                os.makedirs(self.trash_dir, exist_ok=True)
+                target = self._trash_path_for(os.path.basename(file_path))
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                os.remove(file_path)
+                self._parse_cache.pop(file_path, None)
+            except OSError as e:
+                logger.error(f"Failed to trash bucket / 移入回收站失败: {bucket_id}: {e}")
+                return None
+
+        logger.info(f"Trashed bucket / 移入回收站: {bucket_id}")
+        return {
+            "id": bucket_id,
+            "name": post.get("name", bucket_id),
+            "trashed_from": rel,
+            "trashed_at": post.get("trashed_at", ""),
+        }
+
+    def _find_trash_file(self, bucket_id: str) -> Optional[str]:
+        if not bucket_id or not os.path.exists(self.trash_dir):
+            return None
+        for fname in os.listdir(self.trash_dir):
+            if not fname.endswith(".md"):
+                continue
+            path = os.path.join(self.trash_dir, fname)
+            bucket = self._load_bucket(path)
+            if bucket and bucket["id"] == bucket_id:
+                return path
+        return None
+
+    async def list_trash(self) -> list[dict]:
+        """列出回收站里的桶，最近删的在前。"""
+        items = []
+        if not os.path.exists(self.trash_dir):
+            return items
+        for fname in sorted(os.listdir(self.trash_dir)):
+            if not fname.endswith(".md"):
+                continue
+            bucket = self._load_bucket(os.path.join(self.trash_dir, fname))
+            if not bucket:
+                continue
+            meta = bucket["metadata"]
+            items.append({
+                "id": bucket["id"],
+                "name": meta.get("name", bucket["id"]),
+                "type": meta.get("type", "dynamic"),
+                "domain": meta.get("domain", []),
+                "tags": meta.get("tags", []),
+                "importance": meta.get("importance", 5),
+                "created": meta.get("created", ""),
+                "trashed_at": meta.get("trashed_at", ""),
+                "trashed_from": meta.get("trashed_from", ""),
+                "content_preview": bucket["content"][:200],
+            })
+        items.sort(key=lambda x: x["trashed_at"], reverse=True)
+        return items
+
+    async def restore_from_trash(self, bucket_id: str) -> bool:
+        """
+        Put a trashed bucket back where it came from.
+        把回收站里的桶放回原处（原目录没了就重建；原位被占就改名落地）。
+        """
+        async with self._lock_for(bucket_id):
+            path = self._find_trash_file(bucket_id)
+            if not path:
+                return False
+            try:
+                post = frontmatter.load(path)
+                rel = post.get("trashed_from") or os.path.join(
+                    "dynamic", os.path.basename(path)
+                )
+                dest = safe_path(self.base_dir, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if os.path.exists(dest):
+                    stem, ext = os.path.splitext(dest)
+                    dest = f"{stem}-restored{ext}"
+
+                post.metadata.pop("trashed_from", None)
+                post.metadata.pop("trashed_at", None)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                os.remove(path)
+                self._parse_cache.pop(path, None)
+            except (OSError, ValueError) as e:
+                logger.error(f"Failed to restore bucket / 恢复失败: {bucket_id}: {e}")
+                return False
+
+        logger.info(f"Restored bucket / 从回收站恢复: {bucket_id}")
+        return True
+
+    async def purge_trash(self, bucket_id: str) -> bool:
+        """彻底删掉回收站里的某个桶（不可恢复）。"""
+        async with self._lock_for(bucket_id):
+            path = self._find_trash_file(bucket_id)
+            if not path:
+                return False
+            try:
+                os.remove(path)
+                self._parse_cache.pop(path, None)
+            except OSError as e:
+                logger.error(f"Failed to purge bucket / 彻底删除失败: {bucket_id}: {e}")
+                return False
+        logger.info(f"Purged bucket / 彻底删除: {bucket_id}")
+        return True
+
+    async def purge_all_trash(self) -> list[str]:
+        """清空回收站，返回被彻底删掉的 id 列表。"""
+        purged = []
+        for item in await self.list_trash():
+            if await self.purge_trash(item["id"]):
+                purged.append(item["id"])
+        return purged
 
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
