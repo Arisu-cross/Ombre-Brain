@@ -282,6 +282,59 @@ class EmbeddingEngine:
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
+    async def search_within(
+        self, query: str, bucket_ids: list[str], min_sim: float = 0.0
+    ) -> list[tuple[str, float]] | None:
+        """在**指定候选桶集合内**做向量检索，返回 (bucket_id, 相似度) 按分降序。
+
+        和 search_similar 的区别:后者是全库排序后取 top_k —— 数量少的类别
+        (比如 feel)会被普通桶整个挤出前 k 名,等于搜不到。这里先圈定候选
+        再排序,类别内部的相对次序才是准的。
+
+        返回值区分「没命中」和「用不了」:
+          - list(可能为空) = 向量通道正常工作,空列表就是真的没有够相似的
+          - None           = 向量通道不可用(未启用/生成查询向量失败/读库出错)
+                             调用方据此降级到字面匹配,并且**要告诉模型降级了**
+        """
+        if not self.enabled:
+            return None
+        if not bucket_ids:
+            return []   # 候选为空 ≠ 通道坏了,别让调用方误报降级
+
+        try:
+            query_embedding = await self._generate_embedding(query)
+        except Exception as e:
+            logger.warning(f"Query embedding failed / 查询向量生成失败: {e}")
+            return None
+        if not query_embedding:
+            return None
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
+                (self.model,),
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Embedding db read failed / 读取向量库失败: {e}")
+            return None
+
+        wanted = set(bucket_ids)
+        results = []
+        for bucket_id, emb_json in rows:
+            if bucket_id not in wanted:
+                continue
+            try:
+                sim = self._cosine_similarity(query_embedding, json.loads(emb_json))
+            except Exception:
+                continue
+            if sim >= min_sim:
+                results.append((bucket_id, sim))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
     async def find_similar_buckets(
         self, bucket_id: str, top_k: int = 3, min_sim: float = 0.5
     ) -> list[tuple[str, float]]:

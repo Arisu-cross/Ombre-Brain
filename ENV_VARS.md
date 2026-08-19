@@ -10,6 +10,8 @@
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |
 | `BREATH_RECENT_N` | 否 | `3` | 无参 breath / 唤醒 / breath-hook 里「最近记下」（hold 写入的动态桶）浮现条数，设 `0` 关闭 |
+| `FEEL_SIM_THRESHOLD` | 否 | `0.65` | `feel(query=...)` 认定「相关」的向量相似度门槛。定高是有意的：拿低相关的 feel 凑数比返回「没有」更糟。命中率太低就调到 `0.5`~`0.6`，老翻出不相干的就调高 |
+| `FEEL_MAX_TOKENS` | 否 | `4000` | `feel(query=...)` 一次返回的 token 上限（逐字返回不摘要，太长会挤占对话窗口）。预算再紧也保底给一条 |
 | `OMBRE_UTC_OFFSET` | 否 | `8` | 记忆时间戳的 UTC 偏移小时数（默认北京时间）。容器多为 UTC，不设的话后半夜的记忆会被记成前一天 |
 | `OMBRE_STATELESS` | 否 | `1` | streamable-http 无状态模式 + JSON 响应：每次调用独立请求，服务器重启后旧客户端连接依然可用（常驻型客户端不再需要重启进程）。设 `0` 恢复有状态会话 |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 | — | 预设 Dashboard 访问密码；设置后覆盖文件存储的密码，首次访问不弹设置向导 |
