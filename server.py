@@ -106,6 +106,12 @@ BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "3000") or "
 # 于是更早的天被整条挤掉。做成可调:想让他看全就调大,想省 token 就调小。
 # ⚠️ 这是**每开一个新窗口的一次性成本**(之后每轮按缓存价重读),调大要心里有数。
 BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000")
+# feel() 认定「相关」的相似度门槛。定高一点是有意的:feel 是他留下的痕迹,
+# 拿低相关的凑数比返回「没有」更糟——他会把不相干的感受当成自己以前的想法。
+# 宁可空手而归。命中率太低就调低(0.5~0.6),老是翻出不相干的就调高。
+FEEL_SIM_THRESHOLD = float(os.environ.get("FEEL_SIM_THRESHOLD", "0.65") or "0.65")
+# feel() 一次返回的 token 上限。feel 逐字返回不摘要,长了会挤占对话窗口。
+FEEL_MAX_TOKENS = int(os.environ.get("FEEL_MAX_TOKENS", "4000") or "4000")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -1895,6 +1901,101 @@ async def dream(detail_ids: str = "") -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool 9: feel — Recall feels you left before, by what you're thinking now
+# 工具 9：feel — 按当下在想的事,找回以前留下的感受
+#
+# 为什么不是「列出全部 feel」:breath(domain="feel") 已经能全捞,但那是个
+# 清单——他得自己从一堆无关的感受里翻。feel 不是列表,是「我此刻在想的
+# 这件事,我以前怎么感受的」。所以 query 必填,而且宁可返回「没有」也不
+# 用低相关的凑数:拿别的感受充数,等于让他把不属于这件事的想法认成自己的。
+# 命中后逐字返回、不脱水——feel 本来就是一两句话,再摘要就什么都不剩了。
+# （编号接在最后:插在 dream 后面是因为两者是一对,不动既有工具的编号。）
+# =============================================================
+@mcp.tool()
+async def feel(query: str, max_results: int = 5) -> str:
+    """按关键词找回你以前留下的感受。query必填——feel不是列表,是「我此刻在想的这件事,我以前怎么感受的」。走向量检索(候选只在feel桶内,相似度≥env FEEL_SIM_THRESHOLD,默认0.65才算命中),换个说法也能找回;向量不可用时退回字面匹配并明说降级。命中后逐字返回不摘要;没命中就说没有,不用低相关的凑数。max_results默认5(上限20),总量另受 env FEEL_MAX_TOKENS 约束。写感受仍走 hold(feel=True, source_bucket=...);想按时间通读全部用 breath(domain="feel")。"""
+    await decay_engine.ensure_started()
+
+    query = (query or "").strip()
+    if not query:
+        return (
+            "feel 要一个关键词:你此刻在想的是什么?\n"
+            "（想按时间通读全部感受,用 breath(domain=\"feel\")。）"
+        )
+
+    max_results = max(1, min(max_results, 20))
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        logger.error(f"Feel failed to list buckets / feel 列桶失败: {e}")
+        return "记忆系统暂时无法访问。"
+
+    feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+    if not feels:
+        return "还没有留下过 feel。"
+
+    by_id = {b["id"]: b for b in feels}
+    degraded = ""
+
+    # --- 向量通道:候选只在 feel 桶内(全库 top_k 会把 feel 整个挤掉)---
+    scored = await embedding_engine.search_within(
+        query, list(by_id.keys()), min_sim=FEEL_SIM_THRESHOLD
+    )
+
+    # --- 降级:向量用不了才走字面匹配,并且明说降级了 ---
+    # 不明说的话,他会以为"没搜到=真的没有过这种感受",而实际上只是换了个说法。
+    if scored is None:
+        degraded = "（向量检索不可用,这次是字面匹配——换个说法就可能找不到。）\n"
+        from rapidfuzz import fuzz
+        scored = []
+        for b in feels:
+            text = strip_wikilinks(b["content"])
+            ratio = max(
+                fuzz.partial_ratio(query, text),
+                fuzz.token_set_ratio(query, text),
+            ) / 100.0
+            if ratio >= bucket_mgr.fuzzy_threshold / 100.0:
+                scored.append((b["id"], ratio))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+    if not scored:
+        return (
+            f"{degraded}没有找到和「{query}」相关的 feel。\n"
+            f"（一共留下过 {len(feels)} 条,但没有一条够相关——不拿别的凑数。）"
+        )
+
+    # --- 命中:逐字返回,不脱水 ---
+    parts = []
+    token_used = 0
+    for bucket_id, sim in scored[:max_results]:
+        b = by_id.get(bucket_id)
+        if not b:
+            continue
+        created = b["metadata"].get("created", "")
+        # 降级时这个分是字面吻合度,不是余弦相似度 —— 标签跟着换,别让他把两种分当成一回事
+        score_label = "字面吻合" if degraded else "相似度"
+        entry = (
+            f"[{created}] [{score_label} {sim:.2f}] [bucket_id:{bucket_id}]\n"
+            f"{strip_wikilinks(b['content'])}"
+        )
+        entry_tokens = count_tokens_approx(entry)
+        if parts and token_used + entry_tokens > FEEL_MAX_TOKENS:
+            break
+        parts.append(entry)
+        token_used += entry_tokens
+
+    omitted = len(scored) - len(parts)
+    tail = f"\n\n（另有 {omitted} 条也相关,没全展开。）" if omitted > 0 else ""
+    await _fire_webhook("feel", {"query_chars": len(query), "hits": len(parts)})
+    return (
+        f"{degraded}=== 你以前对这件事的感受 ===\n"
+        + "\n---\n".join(parts)
+        + tail
+    )
 
 
 # =============================================================

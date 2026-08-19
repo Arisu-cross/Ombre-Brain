@@ -166,6 +166,8 @@ def mock_embedding_engine():
     ee.enabled = False
     ee.generate_and_store = AsyncMock(return_value=None)
     ee.search_similar = AsyncMock(return_value=[])
+    # None = 向量通道不可用 → feel() 应降级到字面匹配并明说(见 search_within 文档)
+    ee.search_within = AsyncMock(return_value=None)
     ee.delete_embedding = AsyncMock(return_value=True)
     ee.get_embedding = AsyncMock(return_value=None)
     return ee

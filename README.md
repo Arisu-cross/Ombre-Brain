@@ -322,6 +322,7 @@ breath(query="今天很累")
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 显式调用的自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve；唤醒不自动触发 / Explicit self-reflection — not auto-triggered on wake-up |
+| `feel` | 按关键词找回以前留下的感受。`query` 必填——候选只在 feel 桶内做向量检索，相似度 ≥ `FEEL_SIM_THRESHOLD`(默认 0.65)才算命中，命中后逐字返回不摘要；未命中不返回，也不用低相关的凑数。向量不可用时退回字面匹配并明说降级 / Recall past feels by what you're thinking about now. `query` required — vector search scoped to feel buckets only, hits returned verbatim, no low-relevance padding |
 
 ## 安装 / Setup
 
@@ -540,7 +541,8 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 - `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
 - `source_bucket` 指向被消化的记忆，会被标记为「已消化」→ 加速淡化到无限小，但不会被删除
 - Feel 不参与普通浮现、不衰减、不参与 dreaming
-- 用 `breath(domain="feel")` 读取之前的 feel
+- 读回来有两条路：`feel(query="...")` 按当下在想的事找回（向量检索，逐字返回，宁可空手而归也不拿低相关的凑数）；`breath(domain="feel")` 按时间通读全部
+- Two ways to read them back: `feel(query="...")` recalls by what you're thinking about now; `breath(domain="feel")` reads all of them by time
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
