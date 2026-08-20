@@ -166,3 +166,30 @@ async def test_token_budget_keeps_at_least_one(patched_server, bucket_mgr, mock_
     out = await patched_server.feel("感受")
     assert out.count("bucket_id:") == 1
     assert "另有 2 条" in out
+
+
+@pytest.mark.asyncio
+async def test_feel_cannot_be_resolved(patched_server, bucket_mgr):
+    """feel 是痕迹不是待办 —— 不许被标成「已解决」。
+
+    标了会让它沉底、按已处理淡化,而一段感受本就没有「处理完」这回事。
+    整条拒绝而不是悄悄跳过:悄悄跳过他会以为改成功了。
+    """
+    fid = await _make_feel(bucket_mgr, FEEL_HOTPOT)
+    out = await patched_server.trace(bucket_id=fid, resolved=1)
+    assert "没有改" in out and "痕迹" in out
+
+    import frontmatter as fm
+    meta = fm.load(bucket_mgr._find_bucket_file(fid)).metadata
+    assert not meta.get("resolved"), "feel 被标成已解决了"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_bucket_can_still_be_resolved(patched_server, bucket_mgr):
+    """别误伤普通记忆:该沉底的照样能沉底。"""
+    bid = await bucket_mgr.create(content="她的体检结果出来了,没事。", domain=["健康"], importance=6)
+    out = await patched_server.trace(bucket_id=bid, resolved=1)
+    assert "没有改" not in out
+
+    import frontmatter as fm
+    assert fm.load(bucket_mgr._find_bucket_file(bid)).metadata.get("resolved") is True

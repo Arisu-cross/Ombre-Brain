@@ -271,6 +271,28 @@ class BucketManager:
         async with self._lock_for(bucket_id):
             return await self._update_unlocked(bucket_id, **kwargs)
 
+    async def mark_resurfaced(self, bucket_id: str, when: str = None) -> bool:
+        """记下「这条旧事刚被重提过」,**不碰 last_active**。
+
+        为什么不能用 update():它会把 last_active 刷成现在 —— 那等于告诉衰减引擎
+        「这条刚被想起」,分数被抬高、冷却时间被重置,旧事重提反而改写了它想
+        观察的那个量。这个字段只描述「怎么对待过它」,**绝不参与算分**,
+        唯一的用处是让同一件旧事别连着几轮反复被翻出来。
+        """
+        async with self._lock_for(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+            try:
+                post = frontmatter.load(file_path)
+                post["last_resurfaced"] = when or now_iso()
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                return True
+            except Exception as e:
+                logger.warning(f"Mark resurfaced failed / 标记重提失败: {bucket_id}: {e}")
+                return False
+
     async def touch_archived_at(self, bucket_id: str, when: str = None) -> bool:
         """把归档桶的 archived_at 刷成指定时刻(默认现在)。
 
