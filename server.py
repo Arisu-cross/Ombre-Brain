@@ -1705,6 +1705,26 @@ async def trace(
     if digested in (0, 1):
         common["digested"] = bool(digested)
 
+    # --- feel 不该被「解决」---
+    # feel 是他写下的痕迹,不是待办。标成 resolved 会让它沉底、按已处理淡化 ——
+    # 而一段感受本来就该留着它原来的形状,没有"处理完"这回事。
+    # 整条拒绝而不是悄悄跳过:悄悄跳过他会以为改成功了。resolved=0(重新激活)不拦。
+    if common.get("resolved") is True:
+        feel_ids = []
+        for bid in ids:
+            try:
+                b = await bucket_mgr.get(bid)
+            except Exception:
+                continue
+            if b and b["metadata"].get("type") == "feel":
+                feel_ids.append(bid)
+        if feel_ids:
+            return (
+                f"没有改:{', '.join(feel_ids)} 是 feel。\n"
+                "feel 是你留下的痕迹,不是待办 —— 它没有「解决」这回事,就该留着本来的形状。\n"
+                "（真要让它别再出现,用 trace(digested=1) 隐藏;要改字就传 content。）"
+            )
+
     # --- E3: batch mode (name & content ignored) / 批量模式（忽略 name/content）---
     if is_batch:
         if not common:
