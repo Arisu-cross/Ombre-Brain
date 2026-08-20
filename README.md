@@ -321,7 +321,7 @@ breath(query="今天很累")
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
-| `dream` | 显式调用的自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve；唤醒不自动触发 / Explicit self-reflection — not auto-triggered on wake-up |
+| `dream` | 显式调用的自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve；唤醒不自动触发。末尾附「旧事重提」：很久没被想起、但当初有分量的旧记忆（含已被衰减归档的），按「久+情绪+一直没提起」挑，**不看衰减权重** / Explicit self-reflection — not auto-triggered on wake-up. Also surfaces long-forgotten memories (including decay-archived ones), ranked by idleness + emotion, deliberately NOT by decay score |
 | `feel` | 按关键词找回以前留下的感受。`query` 必填——候选只在 feel 桶内做向量检索，相似度 ≥ `FEEL_SIM_THRESHOLD`(默认 0.65)才算命中，命中后逐字返回不摘要；未命中不返回，也不用低相关的凑数。向量不可用时退回字面匹配并明说降级 / Recall past feels by what you're thinking about now. `query` required — vector search scoped to feel buckets only, hits returned verbatim, no low-relevance padding |
 
 ## 安装 / Setup
@@ -531,6 +531,8 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 - 值得放下的 → `trace(resolved=1)` 让它沉底
 - 有沉淀的 → 写 `feel`，记录模型自己的感受
 - 没有沉淀就不写，不强迫产出
+
+**旧事重提 / Resurfacing**：`dream()` 末尾额外捞 `RESURFACE_N` 条很久没被想起的旧记忆——**候选池包含 `archive/`**（衰减约 60~80 天就把普通桶归档，只看活桶等于捞不到真正的旧事；会话归档除外，它有自己的浮现通道）。排序刻意不用衰减分（分里闲置越久越低，正好相反），改用「情绪重 × 闲置久 × 一直没被提起 × 当初记得牢」。重提**不刷新 `last_active`**——否则等于告诉衰减引擎「这条刚被想起」，把它要观察的量改掉了；只写一个不参与算分的 `last_resurfaced` 做冷却。
 
 ### Feel — 带走的东西
 Feel 不是事件记录，是**模型带走的东西**——一句感受、一个未解答的问题、一个观察到的变化。

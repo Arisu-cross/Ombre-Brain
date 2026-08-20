@@ -112,6 +112,22 @@ BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000
 FEEL_SIM_THRESHOLD = float(os.environ.get("FEEL_SIM_THRESHOLD", "0.65") or "0.65")
 # feel() 一次返回的 token 上限。feel 逐字返回不摘要,长了会挤占对话窗口。
 FEEL_MAX_TOKENS = int(os.environ.get("FEEL_MAX_TOKENS", "4000") or "4000")
+# dream() 的「旧事重提」通道:每次做梦额外捞几条**很久没被想起**的旧记忆。
+# 为什么需要它:dream 原本只看最近新增的 5 个桶 —— 三个月前的事除非他专门去搜,
+# 否则永远浮不上来。而「忘了很久又突然想起」恰恰是记忆最像人的地方。
+# 设 0 = 整条通道关闭(连重提标记都不写)。
+RESURFACE_N = int(os.environ.get("RESURFACE_N", "2") or "2")
+# 多久没被想起才算「旧事」。太短会把上周的事当旧事翻出来,太长则几乎不触发。
+RESURFACE_MIN_IDLE_DAYS = int(os.environ.get("RESURFACE_MIN_IDLE_DAYS", "30") or "30")
+# 同一件旧事重提后多少天内不再翻出来 —— 防止连着几轮都在念叨同一件事。
+RESURFACE_COOLDOWN_DAYS = int(os.environ.get("RESURFACE_COOLDOWN_DAYS", "14") or "14")
+# 旧事重提给多少字的正文摘录(0=只给标题行)。给一点是必要的:只有标题行
+# 他认不出这是哪件事,等于没重提;全文又太贵,要细节他可以 dream(detail_ids=)。
+RESURFACE_EXCERPT_CHARS = int(os.environ.get("RESURFACE_EXCERPT_CHARS", "200") or "200")
+# 重提的最低门槛(见 _resurface_candidates 的打分)。没够这个分就一条都不提 ——
+# 和 feel 同一个道理:**宁可空手而归,也别为了凑数把「那天买了瓶酱油」翻出来。**
+# 分的量级参考:重要度9+情绪强+一年没想起≈17;重要度4+平淡+半年≈2.6。
+RESURFACE_MIN_SCORE = float(os.environ.get("RESURFACE_MIN_SCORE", "4.0") or "4.0")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -776,6 +792,88 @@ def _recent_dynamic(all_buckets: list, limit: int) -> list:
         reverse=True,
     )
     return dyn[:limit]
+
+
+def _resurface_candidates(all_buckets: list, exclude_ids: set, limit: int) -> list:
+    """「旧事重提」:挑几条很久没被想起、但当初记得很牢的旧记忆。
+
+    **刻意不用衰减分数来排。** 衰减分 = 重要度 × 激活次数 × e^(-λ×闲置天数),
+    闲置越久分越低 —— 拿它排序,结果永远是「最近的那几条」,而这条通道要的
+    恰恰是相反的东西。所以这里自己算一个分,把「久」从惩罚项变成加分项:
+
+      情绪重(emotion) —— 平淡的流水账不值得重提,当时有情绪的才值得
+      闲置久(idle)    —— 越久没想起越优先,一年封顶
+      提得少(quiet)   —— 从没被翻出来过的排前面
+      当初记得牢      —— importance 作为总体量级
+
+    每项都留了下限(0.5+),避免任何单项为 0 就把一条本该重提的记忆判死。
+
+    **候选池必须包含 archive/**:衰减引擎大约 60~80 天就把普通桶挪进归档
+    (score=重要度×激活^0.3×e^(-0.05×天),8 分的桶约 66 天就跌破 0.3 阈值)。
+    只在"活着"的桶里找,真正的旧事一条都碰不到 —— 而"已经淡出去了却突然想起"
+    正是这条通道的全部意义。OB 的归档本就是淡去不是删除,捞回来看一眼不违背它。
+
+    排除:钉选/永久/feel(各有自己的浮现通道)、**会话归档**(archive_session
+    写的「给下一个自己的信」,有自己的浮现通道,tags 带 session / domain 是「归档」)、
+    休眠桶(OB 里 dormant = 闲置久且重要度<3,正是不值得重提的那批)、过期便利贴、
+    本轮已在「最近」里出现的,以及冷却期内刚重提过的。
+    """
+    if limit <= 0:
+        return []
+
+    now = now_local()
+    out = []
+    for b in all_buckets:
+        meta = b["metadata"]
+        if meta.get("type") in ("permanent", "feel"):
+            continue
+        if meta.get("pinned") or meta.get("protected") or meta.get("dormant"):
+            continue
+        # 会话归档不进这条通道:它有自己的浮现口(唤醒时的「最近归档」)。
+        # ⚠️ 不能只看 type=="archived" —— 衰减淡出的普通桶也是这个 type,
+        # 而它们恰恰是这条通道要找的。靠 archive_session 写死的标记来分辨。
+        tags = meta.get("tags") or []
+        domains = meta.get("domain") or []
+        if "session" in tags or "归档" in domains:
+            continue
+        if b["id"] in exclude_ids or _is_expired(meta):
+            continue
+
+        last_active_str = str(meta.get("last_active", meta.get("created", "")))
+        try:
+            idle_days = (now - datetime.fromisoformat(last_active_str)).total_seconds() / 86400
+        except (ValueError, TypeError):
+            continue
+        if idle_days < RESURFACE_MIN_IDLE_DAYS:
+            continue
+
+        # 冷却:最近重提过的先放一放,别连着几轮念叨同一件事
+        resurfaced_str = str(meta.get("last_resurfaced", "") or "")
+        if resurfaced_str:
+            try:
+                since = (now - datetime.fromisoformat(resurfaced_str)).total_seconds() / 86400
+                if since < RESURFACE_COOLDOWN_DAYS:
+                    continue
+            except (ValueError, TypeError):
+                pass    # 时间戳坏了就当没重提过,宁可多翻一次也不永久埋掉
+
+        valence = float(meta.get("valence", 0.5) or 0.5)
+        arousal = float(meta.get("arousal", 0.3) or 0.3)
+        emotion = max(arousal, abs(valence - 0.5) * 2)          # 0~1,离"平静中性"多远
+        idle_w = min(idle_days / 365.0, 1.0)                     # 越久越优先,一年封顶
+        quiet_w = 1.0 / (1.0 + float(meta.get("activation_count", 1) or 1))
+        importance = float(meta.get("importance", 5) or 5)
+
+        score = importance * (0.5 + emotion) * (0.5 + idle_w) * (0.5 + quiet_w)
+        if score < RESURFACE_MIN_SCORE:
+            continue    # 不够分量的旧事就让它继续沉着,别为了填满名额硬凑
+        b["resurface_score"] = score
+        b["idle_days"] = idle_days
+        b["faded"] = meta.get("type") == "archived"   # 已被衰减引擎淡出
+        out.append(b)
+
+    out.sort(key=lambda x: x["resurface_score"], reverse=True)
+    return out[:limit]
 
 
 async def _related_note(bucket: dict) -> str:
@@ -1777,7 +1875,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
 # =============================================================
 @mcp.tool()
 async def dream(detail_ids: str = "") -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。默认返回最近5个桶的摘要省token;detail_ids(逗号分隔的bucket_id)指定的桶返回全文,其余仅摘要。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+    """做梦——读取最近新增的记忆桶,供你自省。默认返回最近5个桶的摘要省token;detail_ids(逗号分隔的bucket_id)指定的桶返回全文,其余仅摘要。另附「旧事重提」:几条很久没被想起、但当初记得很牢的旧记忆(带一小段正文,想看全文把它的ID传进detail_ids;env RESURFACE_N可调,设0关闭)。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
     await decay_engine.ensure_started()
     detail_set = {d.strip() for d in detail_ids.split(",") if d.strip()}
 
@@ -1800,6 +1898,22 @@ async def dream(detail_ids: str = "") -> str:
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
     recent = candidates[:5]
 
+    # --- 旧事重提:很久没被想起、但当初记得很牢的旧记忆 ---
+    # 放在这里(而不是并进 recent)是因为两者的挑选逻辑正好相反:
+    # recent 看「新」,这条看「久」。合成一个列表就必然被新的挤掉。
+    resurfaced = []
+    if RESURFACE_N > 0:
+        try:
+            # 单独取一次带 archive/ 的全量:旧事多半已经淡出去了(见下)
+            with_archive = await bucket_mgr.list_all(include_archive=True)
+        except Exception as e:
+            logger.warning(f"Resurface list failed / 旧事重提列桶失败: {e}")
+            with_archive = all_buckets
+        resurfaced = _resurface_candidates(
+            with_archive, exclude_ids={b["id"] for b in recent}, limit=RESURFACE_N
+        )
+
+    # recent 空 ⟹ candidates 空 ⟹ 旧事重提也必然为空(它的候选是 candidates 的子集)
     if not recent:
         return "没有需要消化的新记忆。"
 
@@ -1898,8 +2012,49 @@ async def dream(detail_ids: str = "") -> str:
         except Exception as e:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
-    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
-    await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
+    # --- 旧事重提段:给一小段正文,不然只有标题行他认不出是哪件事 ---
+    resurface_block = ""
+    if resurfaced:
+        r_parts = []
+        for b in resurfaced:
+            meta = b["metadata"]
+            body = strip_wikilinks(b["content"])
+            if b["id"] in detail_set:
+                excerpt = body
+            elif RESURFACE_EXCERPT_CHARS > 0:
+                excerpt = body[:RESURFACE_EXCERPT_CHARS]
+                if len(body) > RESURFACE_EXCERPT_CHARS:
+                    excerpt += "…"
+            else:
+                excerpt = ""
+            head = (
+                f"[{meta.get('name', b['id'])}]"
+                f"{' [已淡出]' if b.get('faded') else ''} "
+                f"约 {int(b['idle_days'])} 天没想起 "
+                f"V{float(meta.get('valence', 0.5)):.1f}/A{float(meta.get('arousal', 0.3)):.1f}\n"
+                f"ID: {b['id']}"
+            )
+            r_parts.append(head + ("\n" + excerpt if excerpt else ""))
+        resurface_block = (
+            "\n\n=== 旧事重提 ===\n"
+            "这些是很久没被想起、但当初对你有分量的事。不是待办,也不要求你做什么——\n"
+            "只是你可能会想起来。想看全文:dream(detail_ids=\"上面的ID\")。\n"
+            "标着[已淡出]的是随时间沉下去的记忆,还在,只是平时不会自己浮上来。\n\n"
+            + "\n---\n".join(r_parts)
+        )
+        # 记下「刚重提过」,冷却期内不再翻出来。这个标记不碰 last_active、
+        # 不参与算分 —— 重提一件旧事不该反过来让它显得"刚被想起"。
+        for b in resurfaced:
+            try:
+                await bucket_mgr.mark_resurfaced(b["id"])
+            except Exception as e:
+                logger.warning(f"Mark resurfaced failed / 标记重提失败: {b['id']}: {e}")
+
+    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + resurface_block
+    await _fire_webhook(
+        "dream",
+        {"recent": len(recent), "resurfaced": len(resurfaced), "chars": len(final_text)},
+    )
     return final_text
 
 
