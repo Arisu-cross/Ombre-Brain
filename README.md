@@ -462,6 +462,32 @@ When set, the in-Dashboard password change is disabled — modify the env var di
 完整环境变量说明见 [ENV_VARS.md](ENV_VARS.md)。
 Full env var reference: [ENV_VARS.md](ENV_VARS.md).
 
+## 记忆银河 / Memory Galaxy
+
+`/galaxy` 把整个记忆库渲染成一片可以穿梭的 3D 星系：一条记忆一颗星。
+`/galaxy` renders the whole vault as a 3D galaxy you can fly through — one star per memory.
+
+- **`created` 决定半径**：最早那条记忆是银河核心，最新的日子在最外圈，银河随着日子往外长
+- **`importance` / `pinned` 决定大小与亮度**：普通 / 重要(≥7) / 珍贵(钉选·≥9) / 核心，四档
+- **`domain` 决定颜色**：配色表在 `galaxy.html` 的 `PAL` 常量里，没配到的分类自动分配柔和色
+- 点一颗星：同类记忆一起亮起、连成星座，正文从屏幕底部浮现
+
+数据走 `GET /api/galaxy`（与 Dashboard 同一把锁），所以**不需要导出脚本、不需要定时任务**——
+新存的记忆下次打开就是新的一颗星。Data comes from `GET /api/galaxy`, behind the same auth as
+the Dashboard, so new memories show up as new stars with no export step.
+
+| Query | 作用 |
+|---|---|
+| `?archive=0` | 不要会话归档（默认包含：归档是 importance 4 的小星，构成日常底色）|
+| `?min=7` | 只要 importance ≥ 7 的记忆 |
+
+标题文案可以用环境变量覆盖，不用改代码：`GALAXY_TITLE` / `GALAXY_SUBTITLE` /
+`GALAXY_MOTTO` / `GALAXY_CORE_EN`。
+
+> 页面基于社区教程「记忆银河 / Memory Galaxy」的模板改造。
+> ⚠️ 这片银河里是真实的记忆——**别把它挂在没有密码的公网地址上**。
+> Based on the community "Memory Galaxy" template. These are real memories: never expose it without auth.
+
 ## 衰减公式 / Decay Formula
 
 $$final\_score = Importance \times activation\_count^{0.3} \times e^{-\lambda \times days} \times combined\_weight \times resolved\_factor \times urgency\_boost$$
