@@ -155,6 +155,9 @@ def mock_dehydrator():
     dh.analyze = AsyncMock(side_effect=fake_analyze)
     dh.merge = AsyncMock(side_effect=fake_merge)
     dh.digest = AsyncMock(side_effect=fake_digest)
+    # 默认「没检测到冲突 / 提炼不出沉淀」——要测这两条通道的用例自己覆盖掉
+    dh.check_conflict = AsyncMock(return_value=[])
+    dh.sediment = AsyncMock(return_value=None)
     dh.api_available = True
     return dh
 

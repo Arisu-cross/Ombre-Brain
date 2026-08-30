@@ -133,6 +133,7 @@ class BucketManager:
         pinned: bool = False,
         protected: bool = False,
         expires_at: str = None,
+        trigger_date: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -179,6 +180,11 @@ class BucketManager:
         # 钉选/永久/feel 桶本就该长留，不设过期（hold 侧已保证不会传进来）。
         if expires_at:
             metadata["expires_at"] = expires_at
+        # 触发日期:到那天(或已过期还没处理)就在唤醒时浮到「今日浮现」。
+        # 和 expires_at 是反的——那个到点撕掉,这个到点才响。
+        if trigger_date:
+            metadata["trigger_date"] = trigger_date
+            metadata["trigger_done"] = False
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -356,6 +362,18 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        # 触发日期:传空串 = 撤销这条提醒(连同已处理标记一起清掉,
+        # 免得留一个孤零零的 trigger_done 在 frontmatter 里没人认领)
+        if "trigger_date" in kwargs:
+            td = str(kwargs["trigger_date"] or "").strip()
+            if td:
+                post["trigger_date"] = td
+                post.metadata.setdefault("trigger_done", False)
+            else:
+                post.metadata.pop("trigger_date", None)
+                post.metadata.pop("trigger_done", None)
+        if "trigger_done" in kwargs:
+            post["trigger_done"] = bool(kwargs["trigger_done"])
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()

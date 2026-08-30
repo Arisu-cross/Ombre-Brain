@@ -59,7 +59,7 @@ from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, date
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -128,6 +128,24 @@ RESURFACE_EXCERPT_CHARS = int(os.environ.get("RESURFACE_EXCERPT_CHARS", "200") o
 # 和 feel 同一个道理:**宁可空手而归,也别为了凑数把「那天买了瓶酱油」翻出来。**
 # 分的量级参考:重要度9+情绪强+一年没想起≈17;重要度4+平淡+半年≈2.6。
 RESURFACE_MIN_SCORE = float(os.environ.get("RESURFACE_MIN_SCORE", "4.0") or "4.0")
+# --- 存入时的矛盾检测 / conflict detection on hold ---
+# 每次 hold 新内容时,捞几条语义最近的旧桶比对日期/数字/关键事实。
+# 检测到冲突**不改任何东西**,只在返回里附警告,怎么处理交给她和他。
+# 设 0 = 整条通道关闭。
+CONFLICT_CHECK_N = int(os.environ.get("CONFLICT_CHECK_N", "3") or "3")
+# 相似度门槛:只有够像的桶才拿来比。调低会误报泛滥(两件不相干的事各有各的日期,
+# 一比一个"矛盾"),这就是为什么这个值定得比检索用的 0.5 高得多。
+CONFLICT_MIN_SIM = float(os.environ.get("CONFLICT_MIN_SIM", "0.78") or "0.78")
+# 向量通道不可用时的退化门槛:按关键词 search 的百分制分数取(满分100)。
+CONFLICT_KEYWORD_MIN = float(os.environ.get("CONFLICT_KEYWORD_MIN", "80") or "80")
+# 一次 hold 最多做几次 LLM 核对(每次一个 API 调用,控制成本和延迟)。
+CONFLICT_MAX_LLM = int(os.environ.get("CONFLICT_MAX_LLM", "2") or "2")
+# --- 新桶自动关联 / auto-link on hold ---
+# 新桶入库时按语义相似度自动挂上既有桶。封存(归档/休眠/过期便利贴)不参与:
+# 关联是给「还活着的记忆」用的路标,指向已经沉下去的东西只会把他带回坟场。
+AUTOLINK_ON_HOLD = os.environ.get("AUTOLINK_ON_HOLD", "1") != "0"
+AUTOLINK_TOP_K = int(os.environ.get("AUTOLINK_TOP_K", "3") or "3")
+AUTOLINK_MIN_SIM = float(os.environ.get("AUTOLINK_MIN_SIM", "0.55") or "0.55")
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -479,6 +497,195 @@ async def dream_hook(request):
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
+# =============================================================
+# 封存判定 + 自动关联
+#
+# 「封存」= 已归档 / 休眠 / 过期便利贴 —— 这些桶不该被新桶挂上关联。
+# =============================================================
+def _is_sealed(meta: dict) -> bool:
+    """这个桶是不是已经封存(归档/休眠/过期便利贴),不参与自动关联。"""
+    return bool(
+        meta.get("type") == "archived"
+        or meta.get("dormant")
+        or _is_expired(meta)
+    )
+
+
+async def _link_targets(bucket_id: str, top_k: int = None, min_sim: float = None) -> list[str]:
+    """给某个桶挑关联对象:语义最近的几个**未封存**桶的 id。
+
+    多捞一些再过滤——直接 top_k 会出现「前3个全是归档桶」于是一个都不剩。
+    embedding 不可用时返回空列表(静默,不影响存入)。
+    """
+    top_k = AUTOLINK_TOP_K if top_k is None else top_k
+    min_sim = AUTOLINK_MIN_SIM if min_sim is None else min_sim
+    try:
+        similar = await embedding_engine.find_similar_buckets(
+            bucket_id, top_k=max(top_k * 4, 8), min_sim=min_sim
+        )
+    except Exception as e:
+        logger.warning(f"Auto-link candidate search failed / 关联候选检索失败 {bucket_id}: {e}")
+        return []
+
+    picked = []
+    for bid, _sim in similar:
+        if len(picked) >= top_k:
+            break
+        try:
+            b = await bucket_mgr.get(bid)
+        except Exception:
+            continue
+        if not b or _is_sealed(b["metadata"]) or b["metadata"].get("type") == "feel":
+            continue
+        picked.append(bid)
+    return picked
+
+
+async def _autolink_new_bucket(bucket_id: str) -> list[str]:
+    """新桶入库后按语义相似度自动建立关联。失败静默——关联建不上不该让存入失败。"""
+    if not AUTOLINK_ON_HOLD:
+        return []
+    try:
+        targets = await _link_targets(bucket_id)
+        if targets:
+            await bucket_mgr.set_related(bucket_id, targets, overwrite=False)
+        return targets
+    except Exception as e:
+        logger.warning(f"Auto-link on hold failed / 入库自动关联失败 {bucket_id}: {e}")
+        return []
+
+
+# =============================================================
+# 矛盾检测:新内容和哪条旧记忆对不上
+#
+# 三道闸,一道比一道贵,就是为了别让误报泛滥、也别让成本失控:
+#   1. 只取语义/关键词上**足够像**的几条旧桶(不像的根本不比)
+#   2. 本地正则先看有没有「日期/数字」这类可对照的硬信号(没有就不问 LLM)
+#   3. 剩下的才交给 LLM 逐条核对(最多 CONFLICT_MAX_LLM 次)
+# 检测到冲突**不动任何数据**,只在 hold 的返回里附警告。
+# =============================================================
+_DATE_PAT = re.compile(
+    r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?|\d{1,2}[-/月]\d{1,2}日?|"
+    r"\d{1,2}:\d{2}|\d{1,2}点(?:\d{1,2}分)?"
+)
+_NUM_PAT = re.compile(r"\d+(?:\.\d+)?\s*(?:块|元|万|千|百|个|人|次|天|周|月|年|岁|斤|公斤|米|公里|小时|分钟|%)")
+
+
+def _fact_signals(text: str) -> set:
+    """抽出文本里可对照的硬信号:日期/时刻 + 带单位的数字。"""
+    text = text or ""
+    return {m.group(0) for m in _DATE_PAT.finditer(text)} | {
+        m.group(0) for m in _NUM_PAT.finditer(text)
+    }
+
+
+def _worth_llm_check(new_content: str, old_content: str) -> bool:
+    """本地预筛:两边都有硬信号、且不完全一样,才值得花一次 LLM 去核对。
+
+    完全一样 = 讲的是同一个日期/数字,那是复述不是矛盾;
+    一边没有 = 没有可对照的东西,LLM 只会去揣摩语气,那正是误报的来源。
+    """
+    a, b = _fact_signals(new_content), _fact_signals(old_content)
+    return bool(a and b and a != b)
+
+
+async def _conflict_candidates(content: str, domain: list) -> list[dict]:
+    """挑比对对象:优先向量语义检索,向量通道不可用时退化到关键词检索。
+
+    退化路径效果稍弱(关键词像不代表说的是同一件事),门槛因此定得更高。
+    """
+    picked: list[dict] = []
+    seen = set()
+    try:
+        vector_results = await embedding_engine.search_similar(content, top_k=CONFLICT_CHECK_N * 3)
+    except Exception as e:
+        logger.warning(f"Conflict vector search failed / 矛盾检测向量检索失败: {e}")
+        vector_results = []
+
+    for bid, sim in vector_results or []:
+        if len(picked) >= CONFLICT_CHECK_N:
+            break
+        if sim < CONFLICT_MIN_SIM or bid in seen:
+            continue
+        try:
+            b = await bucket_mgr.get(bid)
+        except Exception:
+            continue
+        if not b or b["metadata"].get("type") == "feel" or _is_expired(b["metadata"]):
+            continue
+        seen.add(bid)
+        picked.append(b)
+
+    if picked:
+        return picked
+
+    # --- 退化通道:没有向量就按关键词相近度挑 ---
+    try:
+        matches = await bucket_mgr.search(content, limit=CONFLICT_CHECK_N * 2, domain_filter=domain or None)
+    except Exception as e:
+        logger.warning(f"Conflict keyword search failed / 矛盾检测关键词检索失败: {e}")
+        return []
+    for b in matches:
+        if len(picked) >= CONFLICT_CHECK_N:
+            break
+        if b.get("score", 0) < CONFLICT_KEYWORD_MIN:
+            continue
+        if b["metadata"].get("type") == "feel" or _is_expired(b["metadata"]):
+            continue
+        picked.append(b)
+    return picked
+
+
+async def _detect_conflicts(content: str, domain: list) -> list[dict]:
+    """返回 [{"id","name","points":[...]}, ...];没冲突返回 []。
+
+    全程不修改任何桶——这是检测,不是纠正。怎么处理由她定。
+    """
+    if CONFLICT_CHECK_N <= 0 or not content.strip():
+        return []
+    try:
+        candidates = await _conflict_candidates(content, domain)
+    except Exception as e:
+        logger.warning(f"Conflict candidate pick failed / 矛盾检测选取候选失败: {e}")
+        return []
+
+    out = []
+    llm_used = 0
+    for b in candidates:
+        if llm_used >= CONFLICT_MAX_LLM:
+            break
+        old_content = b.get("content", "") or ""
+        if not _worth_llm_check(content, old_content):
+            continue
+        llm_used += 1
+        try:
+            points = await dehydrator.check_conflict(content, old_content)
+        except Exception as e:
+            # 核对不了就当没冲突:矛盾检测是附加提醒,绝不能让它把存入弄失败
+            logger.warning(f"Conflict check call failed / 矛盾核对调用失败: {e}")
+            continue
+        if points:
+            out.append({
+                "id": b["id"],
+                "name": b["metadata"].get("name", b["id"]),
+                "points": points,
+            })
+    return out
+
+
+def _format_conflicts(conflicts: list[dict]) -> str:
+    """把冲突警告拼成给他看的一段话。没冲突返回空串。"""
+    if not conflicts:
+        return ""
+    lines = ["", "⚠️ 这条和已有记忆可能对不上(**没有自动改任何东西**,要不要处理你定):"]
+    for c in conflicts:
+        lines.append(f"  · 旧桶「{c['name']}」({c['id']})")
+        for pt in c["points"]:
+            lines.append(f"      - {pt}")
+    lines.append("  处理方式:确认新的对 → trace(旧桶id, content=...) 更正;两边都要留 → 不用管。")
+    return "\n".join(lines)
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -487,17 +694,31 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
-) -> tuple[str, bool]:
+    trigger_date: str = None,
+) -> tuple[str, bool, dict]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
+    Returns (bucket_id_or_name, is_merged, info).
     检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    返回 (桶ID或名称, 是否合并, info)；info 带 bucket_id 与冲突警告列表。
     """
+    # --- 矛盾检测:先看新内容和哪条旧记忆对不上（只检测，不改数据）---
+    conflicts = await _detect_conflicts(content, domain)
+
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+        existing = []
+
+    # 检测到冲突就**不合并**:自动合并会把「旧说3月5日/新说3月8日」揉成一段
+    # 自相矛盾的正文,连痕迹都不留 —— 那正是矛盾检测要防的事。
+    # 冲突时新内容独立成桶,两个说法都在,由她决定留哪个。
+    if conflicts and existing:
+        logger.info(
+            f"Conflict detected, skipping auto-merge / 检测到矛盾,跳过自动合并: "
+            f"{[c['id'] for c in conflicts]}"
+        )
         existing = []
 
     if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
@@ -525,7 +746,13 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                if trigger_date:
+                    await bucket_mgr.update(bucket["id"], trigger_date=trigger_date)
+                return (
+                    bucket["metadata"].get("name", bucket["id"]),
+                    True,
+                    {"bucket_id": bucket["id"], "conflicts": conflicts, "linked": []},
+                )
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -537,13 +764,18 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        trigger_date=trigger_date or None,
     )
     # --- Generate embedding for new bucket ---
     try:
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, False
+    # --- 新桶自动关联:按语义相似度挂上既有桶(封存桶不参与)---
+    linked = await _autolink_new_bucket(bucket_id)
+    return bucket_id, False, {
+        "bucket_id": bucket_id, "conflicts": conflicts, "linked": linked,
+    }
 
 
 def _summary_line(b: dict, prefix: str = "") -> str:
@@ -768,6 +1000,116 @@ def _is_expired(meta: dict) -> bool:
         return now_local() >= datetime.fromisoformat(str(exp))
     except (ValueError, TypeError):
         return False
+
+
+# =============================================================
+# 触发日期 / trigger_date —— 「到那天再提醒我」
+#
+# 和便利贴(expires_at)正好相反:那个到点撕掉,这个到点才响。
+# 到期(或已过期还没处理)的桶在唤醒时浮进「今日浮现」区,处理完 trace 标
+# trigger_done=1 就不再重复浮现。用的是本地日期(now_local,北京时间),
+# 不是 UTC —— 「今天」必须和她过的那个今天是同一天。
+# =============================================================
+_TRIGGER_ALIASES = {
+    "today": 0, "今天": 0, "今日": 0,
+    "tomorrow": 1, "明天": 1, "明日": 1,
+    "后天": 2, "大后天": 3,
+}
+
+
+def _normalize_trigger_date(raw: str) -> str | None:
+    """把 trigger_date 入参规整成 YYYY-MM-DD;认不出来返回 None。
+
+    支持:YYYY-MM-DD / YYYY/M/D / MM-DD(补当年) / +N(N天后) / today,明天,后天…
+    认不出来**不猜**——宁可回一句「看不懂这个日期」让他重说,
+    也不要默默定在一个错的日子上,那种错要到该响的那天才会被发现。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    today = now_local().date()
+
+    key = raw.lower()
+    if key in _TRIGGER_ALIASES:
+        return (today + timedelta(days=_TRIGGER_ALIASES[key])).isoformat()
+
+    m = re.fullmatch(r"\+(\d{1,4})\s*(?:天|d|days?)?", key)
+    if m:
+        return (today + timedelta(days=int(m.group(1)))).isoformat()
+
+    norm = raw.replace("/", "-").replace(".", "-")
+    norm = re.sub(r"(\d+)年(\d+)月(\d+)日?", r"\1-\2-\3", norm)
+    norm = re.sub(r"(\d+)月(\d+)日?", r"\1-\2", norm)
+
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", norm)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+    else:
+        m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", norm)
+        if not m:
+            return None
+        y = today.year
+        mo, d = (int(x) for x in m.groups())
+    try:
+        return date(y, mo, d).isoformat()
+    except ValueError:
+        return None
+
+
+def _due_triggers(all_buckets: list, today: str = None) -> list:
+    """到期待处理的桶:trigger_date <= 今天 且 trigger_done 不为真。
+
+    按日期升序 —— 拖得最久的排最前,今天才定的排最后。
+    归档/休眠桶照样算:一条提醒不该因为那条记忆自己沉下去就失效,
+    「到点响」是它被写下时就答应过的事。
+    """
+    today = today or now_local().date().isoformat()
+    due = []
+    for b in all_buckets:
+        meta = b.get("metadata", {})
+        td = str(meta.get("trigger_date", "") or "").strip()[:10]
+        if not td or meta.get("trigger_done"):
+            continue
+        if td <= today:
+            b["_overdue_days"] = _days_between(td, today)
+            due.append(b)
+    due.sort(key=lambda x: str(x["metadata"].get("trigger_date", "")))
+    return due
+
+
+def _days_between(earlier: str, later: str) -> int:
+    """两个 YYYY-MM-DD 相差几天;算不出来当 0(只用于展示,不参与判定)。"""
+    try:
+        return (date.fromisoformat(later) - date.fromisoformat(earlier)).days
+    except (ValueError, TypeError):
+        return 0
+
+
+def _trigger_prefix(b: dict) -> str:
+    """今日浮现条目的前缀:今天的标日期,过期的标「已过 N 天」。"""
+    overdue = int(b.get("_overdue_days", 0) or 0)
+    td = str(b["metadata"].get("trigger_date", ""))[:10]
+    if overdue > 0:
+        return f"⏰ [今日浮现·已过{overdue}天 {td}] "
+    return f"⏰ [今日浮现·{td}] "
+
+
+async def _render_due_triggers(due_buckets: list, mode: str, token_budget: int,
+                               min_keep: int = 3) -> list:
+    """今日浮现区渲染:每条自带日期前缀(过期的标已过几天)。"""
+    results = []
+    for b in due_buckets:
+        rendered = await _render_archived(
+            [b], mode, token_budget, min_keep=1 if len(results) < min_keep else 0,
+            prefix=_trigger_prefix(b),
+        )
+        if not rendered:
+            break
+        results.extend(rendered)
+        token_budget -= sum(count_tokens_approx(r) for r in rendered)
+        if token_budget <= 0 and len(results) >= min_keep:
+            break
+    return results
 
 
 def _recent_dynamic(all_buckets: list, limit: int) -> list:
@@ -1050,6 +1392,17 @@ async def breath(
         # 唤醒的重点是「读到上一段发生了什么」,只给标题行等于没醒。
         # 调用方没指定 mode 时,归档与最近记下都用原文(默认 raw,可用环境变量改)。
         wake_mode = mode if mode_explicit else BREATH_WAKE_ARCHIVE_MODE
+
+        # 今日浮现:到期(或过期未处理)的触发日期桶,排在归档之前——
+        # 它是「今天要做的事」,压在一堆昨天的总结下面等于没提醒。
+        due_buckets = _due_triggers(all_buckets)
+        due_results = await _render_due_triggers(due_buckets, wake_mode, token_budget)
+        for r in due_results:
+            token_budget -= count_tokens_approx(r)
+        # 已经在「今日浮现」露过面的,不再在归档/最近记下里重复一遍
+        due_ids = {b["id"] for b in due_buckets}
+        archived_buckets = [b for b in archived_buckets if b["id"] not in due_ids]
+
         min_keep = WAKE_ARCHIVE_MIN if auto_results else 0
         archive_results = await _render_archived(
             archived_buckets, wake_mode, token_budget, min_keep=min_keep
@@ -1060,17 +1413,24 @@ async def breath(
             token_budget -= count_tokens_approx(r)
         # 「最近记下」保持单行:它是线索行,细节让他自己 breath/trace 去查(与 /breath-hook 同口径)
         recent_results = await _render_archived(
-            _recent_dynamic(all_buckets, BREATH_RECENT_N), mode, token_budget,
+            [b for b in _recent_dynamic(all_buckets, BREATH_RECENT_N)
+             if b["id"] not in due_ids],
+            mode, token_budget,
             min_keep=1 if auto_results else 0, prefix="📝 [最近记下] ",
         )
 
-        if not pinned_results and not archive_results and not recent_results:
+        if not pinned_results and not archive_results and not recent_results and not due_results:
             await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
             return "唤醒模式：没有钉选记忆，也没有最近归档的记忆。"
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if due_results:
+            parts.append(
+                "=== 今日浮现 ===\n" + "\n---\n".join(due_results)
+                + "\n(处理完用 trace(bucket_id, trigger_done=1) 标一下,就不再重复浮现)"
+            )
         if archive_results:
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         if recent_results:
@@ -1080,6 +1440,7 @@ async def breath(
             {
                 "mode": "startup" if startup else "wake",
                 "pinned": len(pinned_results),
+                "due": len(due_results),
                 "archived": len(archive_results),
                 "recent": len(recent_results),
             },
@@ -1164,6 +1525,18 @@ async def breath(
         token_budget = max_tokens
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
+
+        # 今日浮现:无参 breath() 也是唤醒口径,同样先给今天该响的那几条
+        due_buckets = _due_triggers(all_buckets)
+        due_results = await _render_due_triggers(
+            due_buckets, mode if mode_explicit else BREATH_WAKE_ARCHIVE_MODE, token_budget,
+        )
+        for r in due_results:
+            token_budget -= count_tokens_approx(r)
+        # 已经在「今日浮现」露过面的,不再在归档/最近记下里重复一遍
+        due_ids = {b["id"] for b in due_buckets}
+        archived_buckets = [b for b in archived_buckets if b["id"] not in due_ids]
+
         # 与唤醒同口径:没显式指定 mode 时归档给原文——无参 breath() 正是他
         # 唤醒协议里用的那一个,只给标题行等于没醒。
         archive_results = await _render_archived(
@@ -1177,18 +1550,24 @@ async def breath(
         recent_buckets = [
             b for b in _recent_dynamic(all_buckets, BREATH_RECENT_N)
             if _passes_date_filter(b["metadata"], date_from, date_to)
+            and b["id"] not in due_ids
         ]
         recent_results = await _render_archived(
             recent_buckets, mode, token_budget,
             min_keep=1 if auto_results else 0, prefix="📝 [最近记下] ",
         )
 
-        if not pinned_results and not archive_results and not recent_results:
+        if not pinned_results and not archive_results and not recent_results and not due_results:
             return "没有钉选记忆，也没有归档的会话总结。"
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if due_results:
+            parts.append(
+                "=== 今日浮现 ===\n" + "\n---\n".join(due_results)
+                + "\n(处理完用 trace(bucket_id, trigger_done=1) 标一下,就不再重复浮现)"
+            )
         if archive_results:
             parts.append("=== 最近归档 ===\n" + "\n---\n".join(archive_results))
         if recent_results:
@@ -1372,8 +1751,9 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     remember_days: int = 0,
+    trigger_date: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。remember_days=只想记几天的临时便利贴(如她说"明天要去医院"这类):到点自动撕掉、不进长期记忆、这几天里正常浮现在「最近记下」;0=普通记忆(默认);与pinned/feel互斥。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。remember_days=只想记几天的临时便利贴(如她说"明天要去医院"这类):到点自动撕掉、不进长期记忆、这几天里正常浮现在「最近记下」;0=普通记忆(默认);与pinned/feel互斥。trigger_date=到那天再提醒我(YYYY-MM-DD,也认"明天"/"3月5日"/"+7"):到期或已过期未处理的桶会在唤醒(breath 无参/wake/startup)时出现在「今日浮现」区,处理完用 trace(id, trigger_done=1) 标掉。存入时会自动比对语义最近的旧记忆,发现日期/数字/事实对不上会在返回里附冲突警告——**不自动改任何东西**,怎么处理你定。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1382,6 +1762,13 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- 触发日期:认不出来的写法直接回绝,不猜(猜错要到该响那天才发现)---
+    trigger_at = None
+    if trigger_date and trigger_date.strip():
+        trigger_at = _normalize_trigger_date(trigger_date)
+        if not trigger_at:
+            return f"看不懂这个触发日期:{trigger_date}。用 YYYY-MM-DD,或「明天」「3月5日」「+7」这类写法。"
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
@@ -1451,12 +1838,13 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            trigger_date=trigger_at,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
-        return f"📌钉选→{bucket_id} {','.join(domain)}"
+        return f"📌钉选→{bucket_id} {','.join(domain)}" + (f" ⏰{trigger_at}" if trigger_at else "")
 
     # --- 便利贴:只记几天、到点自动撕掉的临时记忆 ---
     # 像钉选一样**跳过合并**——便利贴是独立的一条,不该被并进长期桶
@@ -1466,6 +1854,17 @@ async def hold(
     if remember_days and remember_days > 0:
         days = max(1, min(90, int(remember_days)))   # 夹在 1~90 天,防呆
         expires_at = (now_local() + timedelta(days=days)).isoformat()
+        # 便利贴 + 触发日期:别让它在该响之前就被撕掉。
+        # 触发日比过期日晚,就把过期日顺延到触发日之后一天——
+        # 「明天要去医院」这种正是两个都该有的场景,不该逼她二选一。
+        if trigger_at:
+            try:
+                trig_dt = datetime.fromisoformat(trigger_at) + timedelta(days=1)
+                if trig_dt > datetime.fromisoformat(expires_at):
+                    expires_at = trig_dt.isoformat()
+                    days = max(days, (trig_dt - now_local()).days)
+            except (ValueError, TypeError):
+                pass
         bucket_id = await bucket_mgr.create(
             content=content,
             tags=all_tags,
@@ -1476,15 +1875,18 @@ async def hold(
             name=suggested_name or None,
             bucket_type="dynamic",
             expires_at=expires_at,
+            trigger_date=trigger_at,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
-        return f"🗒️便利贴→{bucket_id} 记{days}天 {','.join(domain)}"
+        await _autolink_new_bucket(bucket_id)
+        return (f"🗒️便利贴→{bucket_id} 记{days}天 {','.join(domain)}"
+                + (f" ⏰{trigger_at}" if trigger_at else ""))
 
     # --- Step 2: merge or create / 合并或新建 ---
-    result_name, is_merged = await _merge_or_create(
+    result_name, is_merged, info = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -1492,10 +1894,14 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        trigger_date=trigger_at,
     )
 
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    line = f"{action}{result_name} {','.join(domain)}"
+    if trigger_at:
+        line += f" ⏰{trigger_at}"
+    return line + _format_conflicts(info.get("conflicts"))
 
 
 # =============================================================
@@ -1525,7 +1931,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
+        result_name, is_merged, _info = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1555,7 +1961,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            result_name, is_merged = await _merge_or_create(
+            result_name, is_merged, _info = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -1658,8 +2064,10 @@ async def trace(
     content: str = "",
     delete: bool = False,
     merge: str = "",
+    trigger_date: str = "",
+    trigger_done: int = -1,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏/0取消,content=替换正文,delete=True删除。只传需改的,-1或空=不改。bucket_id支持逗号分隔多个ID批量操作(批量模式下content和name忽略)。merge=另一个bucket_id时,把该源桶合并进bucket_id(内容追加/标签去重/重要度取大/情感取平均/删源桶,钉选桶不可merge)。dormant休眠桶始终可被trace访问修改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏/0取消,content=替换正文,delete=True删除。只传需改的,-1或空=不改。bucket_id支持逗号分隔多个ID批量操作(批量模式下content和name忽略)。merge=另一个bucket_id时,把该源桶合并进bucket_id(内容追加/标签去重/重要度取大/情感取平均/删源桶,钉选桶不可merge)。dormant休眠桶始终可被trace访问修改。trigger_date=设/改触发日期(YYYY-MM-DD,也认「明天」「3月5日」「+7」;传none/clear/-撤销这条提醒),trigger_done=1标记「这条今日浮现已处理」不再重复浮现/0重新激活。"""
 
     ids = [x.strip() for x in (bucket_id or "").split(",") if x.strip()]
     if not ids:
@@ -1704,6 +2112,18 @@ async def trace(
             common["importance"] = 10  # pinned → lock importance
     if digested in (0, 1):
         common["digested"] = bool(digested)
+    # --- 触发日期:设/改/撤销 ---
+    if trigger_date and trigger_date.strip():
+        raw = trigger_date.strip()
+        if raw.lower() in ("none", "clear", "-", "无", "取消"):
+            common["trigger_date"] = ""      # 空串 = 撤销(连 trigger_done 一起清)
+        else:
+            normalized = _normalize_trigger_date(raw)
+            if not normalized:
+                return f"看不懂这个触发日期:{raw}。用 YYYY-MM-DD,或「明天」「3月5日」「+7」这类写法。"
+            common["trigger_date"] = normalized
+    if trigger_done in (0, 1):
+        common["trigger_done"] = bool(trigger_done)
 
     # --- feel 不该被「解决」---
     # feel 是他写下的痕迹,不是待办。标成 resolved 会让它沉底、按已处理淡化 ——
@@ -1785,6 +2205,12 @@ async def trace(
             changed += " → 已隐藏，保留但不再浮现"
         else:
             changed += " → 已取消隐藏，重新参与浮现"
+    if "trigger_date" in updates:
+        changed += (" → 到那天(或过期未处理)会出现在「今日浮现」"
+                    if updates["trigger_date"] else " → 已撤销这条提醒")
+    if "trigger_done" in updates:
+        changed += (" → 已标记处理完，不再重复浮现"
+                    if updates["trigger_done"] else " → 重新等待浮现")
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 
