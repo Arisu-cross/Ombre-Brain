@@ -1,7 +1,7 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-04-19
+> 最后更新：2026-08-30
 
 ---
 
@@ -21,6 +21,8 @@
 - `valence`（事件效价 0~1）、`arousal`（唤醒度 0~1）、`model_valence`（模型独立感受）
 - `importance`（1~10）、`activation_count`（被想起次数）
 - `resolved`（已解决/沉底）、`digested`（已消化/写过 feel）、`pinned`（钉选）
+- `trigger_date`（触发日期 YYYY-MM-DD）、`trigger_done`（这条提醒是否已处理）
+- `related`（关联桶 id 列表）、`sediment`/`sediment_sources`（沉淀摘要桶）、`sediment_of`（被沉淀进哪条）
 - `created`、`last_active` 时间戳
 
 **四种检索模式**
@@ -28,6 +30,7 @@
 2. **关键词+向量双通道搜索**（`breath(query=...)`）：rapidfuzz 模糊匹配 + Gemini embedding 余弦相似度，合并去重
 3. **Feel 独立检索**（`breath(domain="feel")`）：按创建时间倒序返回所有 feel
 4. **随机浮现**：搜索结果 <3 条时 40% 概率漂浮 1~3 条低权重旧桶（模拟人类随机联想）
+5. **心境共鸣**（`breath(valence=/arousal=)` 不带 query）：不看文本，只按各桶情绪坐标与传入坐标的欧氏距离排序返回；只给一个坐标就只比那一个轴。可与 domain/date_from/date_to/importance_min/max_results 组合。钉选桶与 feel 不进这条通道（各有各的入口）
 
 **四维搜索评分**（归一化到 0~100）
 - topic_relevance（权重 4.0）：name×3 + domain×2.5 + tags×2 + body
@@ -52,6 +55,9 @@
 - **智能合并**：新记忆与相似桶（score>75）自动 LLM 合并，valence/arousal 取均值，tags/domain 并集
 - **时间涟漪**：touch 一个桶时，±48h 内创建的桶 activation_count +0.3（上限 5 桶/次）
 - **向量相似网络**：embedding 余弦相似度 >0.5 建边
+- **自动关联**：新桶入库时（hold）按语义相似度挂上前 3 个既有桶；封存桶（归档/休眠/过期便利贴/feel）不参与。存量桶用 `backfill_related.py` 批量补
+- **矛盾检测**：hold 存入时捞语义最近的旧桶比对日期/数字/关键事实，冲突只警告不改数据，且**跳过自动合并**（详见下）
+- **自动消化**：低重要度 + 长期闲置的碎片按语义分组沉淀成摘要桶，原桶归档不删（默认只演习）
 - **Feel 结晶化**：≥3 条相似 feel（相似度>0.7）→ 提示升级为钉选准则
 
 **情感记忆重构**
@@ -61,6 +67,27 @@
 - **Feel 写入**（`hold(feel=True)`）：存模型第一人称感受，标记源记忆为 digested
 - **Dream 做梦**（`dream()`）：返回最近 10 条 + 自省引导 + 连接提示 + 结晶化提示；只在显式调用时触发，唤醒不自动做梦
 - **对话启动流程**：breath()（钉选 + 最近归档 2-5 条，不触发 dream/feel）→ 开始对话
+
+**触发日期（到那天再提醒）**
+- `hold(trigger_date=)` / `trace(trigger_date=)` 设置；写法宽松：`YYYY-MM-DD` / `2026年3月5日` / `明天` / `+7`，认不出来整条回绝（不猜）
+- 唤醒（`breath()` 无参 / `wake` / `startup`）返回里多一段 **「今日浮现」**：`trigger_date <= 今天` 且未标记处理的桶，按日期升序（拖最久的排最前），过期的标「已过 N 天」；排在「最近归档」之前
+- 归档/休眠桶照样浮现（提醒不因记忆自己沉下去而失效）；已在这一段出现的桶不在其它段重复
+- `trace(id, trigger_done=1)` 标记已处理不再重复浮现；`trigger_date="none"` 撤销整条提醒
+- 便利贴（`remember_days`）叠加触发日期时，过期时间自动顺延到触发日之后
+- 用本地日期（`now_local`，UTC+8），不是 UTC
+
+**矛盾检测（存入时，只警告不改数据）**
+- 三道闸控制误报与成本：①只比语义相似度 ≥ `CONFLICT_MIN_SIM`(0.78) 的桶（向量不可用时退化为正文字面相似度 ≥ `CONFLICT_KEYWORD_MIN`(0.75)）；②本地正则先看有没有日期/数字这类硬信号，没有就不问 LLM；③剩下的才 LLM 核对，一次 hold 最多 `CONFLICT_MAX_LLM`(2) 次
+- 检测到冲突时**跳过自动合并**：否则 score>75 的自动合并会把「旧说3月5日/新说3月8日」揉成一段自相矛盾的正文，连痕迹都不留
+- 核对失败/API 不可用一律当「没冲突」，绝不让附加提醒把存入弄失败
+
+**自动消化 / 沉淀（digest_engine.py，默认只演习）**
+- 候选：`importance <= DIGEST_IMPORTANCE_MAX`(4) 且闲置 ≥ `DIGEST_MIN_IDLE_DAYS`(90) 的非钉选桶；钉选/保护/permanent/feel/便利贴/沉淀桶/**带未处理触发日期的桶**一律不碰
+- 分组：有 embedding 走向量贪心聚类（阈值 `DIGEST_SIM_THRESHOLD` 0.62），没有则退化到标签+主题域 Jaccard
+- `digest()` = 演习，只输出计划；`digest(execute=True)` 才整理，每轮最多 `DIGEST_MAX_GROUPS`(3) 组
+- 整理 = 每组提炼一条沉淀桶（`sediment=True`），原桶**归档不删**并写 `sediment_of` 回指；提炼失败整组放弃，不落假摘要
+- 写沉淀标记不刷 `last_active`（否则「很久没被想起」会被整理动作自己抹掉）
+- 后台每 `DIGEST_SCAN_HOURS`(168) 小时扫描一次，**只出计划记日志**；真要自动整理需 `DIGEST_AUTO_EXECUTE=1`
 
 **自动化处理**
 - 存入时 LLM 自动分析 domain/valence/arousal/tags/name
@@ -72,14 +99,15 @@
 
 ### 技术能力
 
-**6 个 MCP 工具**
+**10 个 MCP 工具**
 
 | 工具 | 关键参数 | 功能 |
 |---|---|---|
-| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min**, **wake**, **startup** | 检索/浮现记忆 |
-| `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
+| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min**, **wake**, **startup** | 检索/浮现记忆（无 query 只给 valence/arousal = 心境共鸣模式）|
+| `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal, remember_days, **trigger_date** | 存储记忆（自动矛盾检测 + 自动关联）|
 | `grow` | content | 日记拆分归档 |
-| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
+| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete, merge, **trigger_date**, **trigger_done** | 修改元数据/内容/删除 |
+| `digest` | execute, max_groups | 自动消化：低重要度+长期闲置的碎片按语义分组沉淀成摘要（默认只演习）|
 | `pulse` | include_archive | 系统状态 |
 | `dream` | （无） | 做梦自省 |
 
@@ -172,7 +200,7 @@
 5. Zeabur 部署（`zbpack.json`）
 6. GitHub Actions 自动构建推送 Docker Hub（`.github/workflows/docker-publish.yml`）
 
-**迁移/批处理工具**：`migrate_to_domains.py`、`reclassify_domains.py`、`reclassify_api.py`、`backfill_embeddings.py`、`write_memory.py`、`check_buckets.py`、`import_memory.py`（历史对话导入引擎）
+**迁移/批处理工具**：`migrate_to_domains.py`、`reclassify_domains.py`、`reclassify_api.py`、`backfill_embeddings.py`、`backfill_mood.py`（补情绪坐标）、`backfill_related.py`（补关联）、`write_memory.py`、`check_buckets.py`、`import_memory.py`（历史对话导入引擎）
 
 **降级策略**
 - 脱水 API 不可用 → 直接抛 RuntimeError（设计决策，详见 BEHAVIOR_SPEC.md 三、降级行为表）
@@ -196,6 +224,18 @@
 | `OMBRE_HOOK_URL` | SessionStart 钩子调用的服务器 URL | 否 | `"http://localhost:8000"` |
 | `OMBRE_HOOK_SKIP` | 设为 `"1"` 跳过 SessionStart 钩子 | 否 | 未设置（不跳过） |
 | `OMBRE_DASHBOARD_PASSWORD` | 预设 Dashboard 访问密码；设置后覆盖文件密码，首次访问不弹设置向导 | 否 | `""` |
+| `CONFLICT_CHECK_N` | 存入时最多捞几条旧桶做矛盾比对；`0` = 关闭矛盾检测 | 否 | `3` |
+| `CONFLICT_MIN_SIM` | 矛盾比对的向量相似度门槛（调低 → 误报泛滥）| 否 | `0.78` |
+| `CONFLICT_KEYWORD_MIN` | 向量不可用时的退化门槛：正文对正文的字面相似度 | 否 | `0.75` |
+| `CONFLICT_MAX_LLM` | 一次 hold 最多几次 LLM 核对（控成本/延迟）| 否 | `2` |
+| `AUTOLINK_ON_HOLD` | 新桶入库时自动关联；`0` = 关闭 | 否 | `1` |
+| `AUTOLINK_TOP_K` / `AUTOLINK_MIN_SIM` | 自动关联挂几个 / 相似度门槛 | 否 | `3` / `0.55` |
+| `DIGEST_IMPORTANCE_MAX` | 自动消化的重要度上限（超过不碰）| 否 | `4` |
+| `DIGEST_MIN_IDLE_DAYS` | 闲置多少天才算「长期没被想起」| 否 | `90` |
+| `DIGEST_SIM_THRESHOLD` / `DIGEST_MIN_GROUP` / `DIGEST_MAX_GROUP` | 分组相似度门槛 / 成组下限 / 单组上限 | 否 | `0.62` / `3` / `8` |
+| `DIGEST_MAX_GROUPS` | 一轮最多整理几组（出事也只出这么大）| 否 | `3` |
+| `DIGEST_SCAN_HOURS` | 后台扫描间隔小时；`0` = 不自动扫描 | 否 | `168` |
+| `DIGEST_AUTO_EXECUTE` | `1` = 定期扫描后**真的整理**；默认只出计划记日志 | 否 | `0` |
 
 环境变量优先级：`环境变量 > config.yaml > 硬编码默认值`。所有环境变量在 `utils.py` 中读取并注入 config dict。
 
@@ -210,6 +250,7 @@
            ┌───────────────┼───────────────┬────────────────┐
            ▼               ▼               ▼                ▼
    bucket_manager.py  dehydrator.py  decay_engine.py  embedding_engine.py
+   （另有 digest_engine.py：自动消化/沉淀，依赖上面三个）
    记忆桶 CRUD+搜索   脱水压缩+打标   遗忘曲线+归档   向量化+语义检索
            │               │                                │
            └───────┬───────┘                                │

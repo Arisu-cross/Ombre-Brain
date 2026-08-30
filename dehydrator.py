@@ -117,6 +117,40 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 
 # --- Auto-tagging prompt: analyze content for domain and emotion coords ---
 # --- 自动打标提示词：分析内容的主题域和情感坐标 ---
+CONFLICT_PROMPT = """你是一个事实核对员。用户会给你「旧记忆」和「新内容」两段文本，
+它们讲的是相近的事。你的任务：找出**同一件事上前后对不上的地方**。
+
+只算冲突的：
+1. 同一件事的日期/时间不一致（旧说3月5日，新说3月8日）
+2. 同一个量的数字不一致（旧说三个人，新说五个人；旧说 200 块，新说 500 块）
+3. 同一个事实的表述相反（旧说她不吃辣，新说她爱吃辣；旧说已经辞职，新说还在上班）
+
+**不算冲突的**（重要，宁可漏报也别误报）：
+- 事情有进展、状态自然变化（计划改了、病好了、换工作了）——这是更新，不是矛盾
+- 新内容只是补充细节，旧的没说而已
+- 两段讲的根本不是同一件事
+- 措辞、语气、详略不同
+
+输出格式（纯 JSON，无其他内容）：
+{"conflict": true/false, "points": ["旧:3月5日 / 新:3月8日 —— 体检日期对不上"]}
+
+没有冲突就输出 {"conflict": false, "points": []}。points 每条一句话，
+必须写清「旧的怎么说 / 新的怎么说 / 哪一点对不上」。最多 3 条。"""
+
+
+SEDIMENT_PROMPT = """你是一个记忆沉淀器。用户会给你若干条互相相关、但都已经很久没被想起的旧记忆。
+请把它们提炼成**一条**沉淀摘要，代替这一堆碎片留下来。
+
+要求：
+1. 保住所有还可能有用的事实：人名、地点、日期、数字、结论
+2. 语气克制，第三人称陈述，不要抒情，不要替当事人下判断
+3. 明确写出这些记忆共同讲的是什么
+4. 200 字以内
+
+输出格式（纯 JSON，无其他内容）：
+{"name": "不超过20字的摘要标题", "summary": "沉淀正文", "tags": ["关键词1", "关键词2"]}"""
+
+
 ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出结构化的元数据。
 
 分析规则：
@@ -441,6 +475,99 @@ class Dehydrator:
         if not raw.strip():
             return self._default_analysis()
         return self._parse_analysis(raw)
+
+    # ---------------------------------------------------------
+    # Conflict check: does the new content contradict an old bucket?
+    # 矛盾检测：新内容和某条旧记忆在同一件事上对不上吗？
+    # ---------------------------------------------------------
+    async def check_conflict(self, new_content: str, old_content: str) -> list[str]:
+        """返回冲突点描述列表；[] = 没冲突。
+
+        **不抛异常、不降级报错**：矛盾检测是附加提醒，API 不可用时应当安静地
+        当作「没检测到」——绝不能因为核对不了就把这次 hold 弄失败。
+        """
+        if not self.api_available or not new_content.strip() or not old_content.strip():
+            return []
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": CONFLICT_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"旧记忆：\n{old_content[:1500]}\n\n新内容：\n{new_content[:1500]}",
+                    },
+                ],
+                max_tokens=384,
+                temperature=0.0,
+            )
+            if not response.choices:
+                return []
+            raw = response.choices[0].message.content or ""
+            data = self._parse_json_object(raw)
+            if not data or not data.get("conflict"):
+                return []
+            points = [str(p).strip() for p in (data.get("points") or []) if str(p).strip()]
+            return points[:3]
+        except Exception as e:
+            logger.warning(f"Conflict check failed / 矛盾检测失败: {e}")
+            return []
+
+    # ---------------------------------------------------------
+    # Sediment: distill a group of stale memories into one summary
+    # 沉淀：把一组长期没被想起的旧记忆提炼成一条摘要
+    # ---------------------------------------------------------
+    async def sediment(self, contents: list[str]) -> dict | None:
+        """返回 {"name","summary","tags"}；API 不可用或解析失败返回 None。
+
+        返回 None 时调用方**必须放弃这一组**，不能拿拼接原文当摘要落库——
+        那样只是把碎片换个地方堆着，没有沉淀，还多一个桶。
+        """
+        if not self.api_available or not contents:
+            return None
+        joined = "\n\n---\n\n".join(c[:800] for c in contents[:12])
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SEDIMENT_PROMPT},
+                    {"role": "user", "content": joined[:6000]},
+                ],
+                max_tokens=768,
+                temperature=0.2,
+            )
+            if not response.choices:
+                return None
+            data = self._parse_json_object(response.choices[0].message.content or "")
+            if not data or not str(data.get("summary", "")).strip():
+                return None
+            return {
+                "name": str(data.get("name", "")).strip()[:40],
+                "summary": str(data.get("summary", "")).strip(),
+                "tags": [str(t).strip() for t in (data.get("tags") or []) if str(t).strip()][:10],
+            }
+        except Exception as e:
+            logger.warning(f"Sediment distill failed / 沉淀提炼失败: {e}")
+            return None
+
+    @staticmethod
+    def _parse_json_object(raw: str) -> dict | None:
+        """从模型输出里抠出第一个 JSON 对象（容忍 ```json 包裹和前后废话）。"""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
 
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks

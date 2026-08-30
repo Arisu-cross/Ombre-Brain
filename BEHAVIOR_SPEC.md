@@ -487,6 +487,66 @@ python restore_from_backup.py backups/backup-2026-07-01.json --overwrite # 用�
 
 ---
 
+### 场景 16：给一条记忆定一个「到那天再说」的日子（trigger_date）
+
+**用户操作**：她说「下周三要去复诊」→ Claude 调 `hold("下周三牙医复诊", trigger_date="2026-09-09")`。
+
+**系统内部发生什么**：
+
+1. `_normalize_trigger_date()` 把写法规整成 `YYYY-MM-DD`（认 `2026年9月9日`/`明天`/`+7`）；认不出来**整条回绝**，不落库、不猜
+2. 桶 frontmatter 写入 `trigger_date` + `trigger_done: false`
+3. 到那天（或过期还没处理），下一次唤醒 —— `breath()` 无参 / `wake=True` / `startup=True` —— 返回里多出 `=== 今日浮现 ===` 段：按日期升序（拖最久的排最前），过期的标「已过 N 天」，位置在「最近归档」之前
+4. 处理完 `trace(id, trigger_done=1)` → 不再浮现；`trace(id, trigger_date="none")` → 撤销整条提醒（连 `trigger_done` 一起清）
+5. 归档/休眠桶照样浮现；已在这一段出现的桶不在「最近归档」「最近记下」里重复
+
+---
+
+### 场景 17：只带着一个心情去检索（心境共鸣）
+
+**用户操作**：`breath(valence=0.15, arousal=0.6)`（不带 query）。
+
+**系统内部发生什么**：
+
+1. `breath` 走心境通道，调 `bucket_mgr.search_by_mood()`
+2. 不做任何文本匹配：逐桶算 `(valence, arousal)` 到传入坐标的欧氏距离，近的排前（只给一个坐标就只比那一个轴）；距离撞车时近期的优先
+3. 钉选/保护桶与 feel 桶不进这条通道（各有各的入口）
+4. 可与 `domain` / `date_from` / `date_to` / `importance_min` / `max_results` / `max_tokens` 组合；`importance_min` 在这里只当过滤器，排序仍按心境
+5. 返回每条附 `情感坐标 Vx.x/Ax.x 距离 0.xx`
+6. **带 query 时不走这条**：那时情绪坐标仍是四维评分里的一维（老行为不变）
+
+---
+
+### 场景 18：存入时发现和旧记忆对不上（矛盾检测）
+
+**用户操作**：她之前说体检约在 3 月 5 日，今天说改到 3 月 8 日 → Claude 照常 `hold(...)`。
+
+**系统内部发生什么**：
+
+1. `_detect_conflicts()` 先选比对对象：向量语义检索取相似度 ≥ 0.78 的前几条；向量不可用时退化为「正文对正文字面相似度 ≥ 0.75」
+2. 本地正则预筛：两边都得有日期/数字这类硬信号且不相同，才值得花一次 LLM（没硬信号时 LLM 只会揣摩语气，那正是误报来源）
+3. LLM 逐条核对（一次 hold 最多 2 次），只认「同一件事的日期/数字/事实相反」，事情有进展、补充细节不算冲突
+4. **检测到冲突 → 跳过自动合并**，新内容独立成桶，两个说法都在
+5. 存入照常成功，返回末尾附警告：指明旧桶 id + 名字 + 具体矛盾点，并写明「没有自动改任何东西」
+6. 核对失败 / API 不可用 → 当作没冲突，安静跳过
+
+---
+
+### 场景 19：定期把长期没被想起的碎片沉淀掉（digest）
+
+**用户操作**：`digest()` 看计划 → 确认无误 → `digest(execute=True)`。
+
+**系统内部发生什么**：
+
+1. 候选：`importance<=4` 且闲置 ≥90 天的非钉选桶；钉选/保护/permanent/feel/便利贴/沉淀桶/**带未处理触发日期的桶**都排除
+2. 分组：有 embedding 走向量贪心聚类（≥0.62），否则退化到标签+主题域 Jaccard；不足 3 条不成组（剩下的留在原地，不硬塞）
+3. **演习**（默认）：只输出「哪几组、每组哪些桶、闲置多久」，一个字都不改
+4. **执行**：每组 `dehydrator.sediment()` 提炼一条沉淀桶（`sediment=True`，`sediment_sources=[...]`，`related` 指向源桶），源桶写 `sediment_of` 后**归档不删**
+5. 提炼失败 → 整组原样保留，不落假摘要；每轮最多整理 3 组
+6. 写沉淀标记不刷 `last_active`（否则「很久没被想起」会被整理动作自己抹掉）
+7. 后台每 168 小时扫描一次，默认**只出计划记日志**；`DIGEST_AUTO_EXECUTE=1` 才自动动手
+
+---
+
 ## 三、边界与降级行为
 
 | 场景 | 异常情况 | 降级行为 |
@@ -513,6 +573,13 @@ python restore_from_backup.py backups/backup-2026-07-01.json --overwrite # 用�
 | 所有 feel 操作 | `source_bucket` 不存在 | `logger.warning()` 记录，feel 桶本身仍成功创建 |
 | `dehydrator.dehydrate()` / `analyze()` / `merge()` / `digest()` | API 不可用（`api_available=False`）| **直接向 MCP 调用端明确报错（`RuntimeError`）**，无本地降级。本地关键词提取质量不足以替代语义打标与合并，静默降级比报错更危险（可能产生错误分类记忆）。 |
 | `embedding_engine.search_similar()` | `enabled=False` | 直接返回 `[]`，调用方 fallback 到 keyword 搜索 |
+| `hold()` 矛盾检测 | 向量通道不可用 | 退化为「正文对正文字面相似度 ≥ 0.75」选比对对象，效果稍弱但可用 |
+| `hold()` 矛盾检测 | `check_conflict()` 抛错 / API 不可用 | `logger.warning()`，当作没冲突。附加提醒**绝不能**让存入失败 |
+| `hold()` 自动关联 | embedding 不可用 / 无够像的桶 | 静默跳过，不影响存入 |
+| `hold(trigger_date=)` | 日期写法认不出 | **整条回绝并说明**，不落库、不猜（猜错要到该响那天才会被发现）|
+| `digest(execute=True)` | `sediment()` 提炼失败 / 返回空 | 整组原样保留，不创建沉淀桶（绝不拿拼接原文冒充摘要）|
+| `digest()` | 候选不足 `min_group` | 返回「不到一组的下限」，什么都不做 |
+| `breath(valence=/arousal=)` 心境模式 | 没有任何非钉选桶 | 返回 `"没有情绪坐标接近的记忆。"` |
 
 ---
 

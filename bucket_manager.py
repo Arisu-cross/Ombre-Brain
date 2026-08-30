@@ -133,6 +133,7 @@ class BucketManager:
         pinned: bool = False,
         protected: bool = False,
         expires_at: str = None,
+        trigger_date: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -179,6 +180,11 @@ class BucketManager:
         # 钉选/永久/feel 桶本就该长留，不设过期（hold 侧已保证不会传进来）。
         if expires_at:
             metadata["expires_at"] = expires_at
+        # 触发日期:到那天(或已过期还没处理)就在唤醒时浮到「今日浮现」。
+        # 和 expires_at 是反的——那个到点撕掉,这个到点才响。
+        if trigger_date:
+            metadata["trigger_date"] = trigger_date
+            metadata["trigger_done"] = False
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -356,6 +362,18 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        # 触发日期:传空串 = 撤销这条提醒(连同已处理标记一起清掉,
+        # 免得留一个孤零零的 trigger_done 在 frontmatter 里没人认领)
+        if "trigger_date" in kwargs:
+            td = str(kwargs["trigger_date"] or "").strip()
+            if td:
+                post["trigger_date"] = td
+                post.metadata.setdefault("trigger_done", False)
+            else:
+                post.metadata.pop("trigger_date", None)
+                post.metadata.pop("trigger_done", None)
+        if "trigger_done" in kwargs:
+            post["trigger_done"] = bool(kwargs["trigger_done"])
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
@@ -849,6 +867,75 @@ class BucketManager:
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
+
+    # ---------------------------------------------------------
+    # Mood-only retrieval: no text, rank by emotion-coordinate distance
+    # 纯心境检索：不看文本，只按情绪坐标距离排序
+    #
+    # 为什么单开一条通道：search() 没有 query 就直接返回空，情绪坐标在那里
+    # 只能给关键词检索当配料（四维评分里的一维），没法单独当主菜。
+    # 而「现在这个心情，让我想起过什么」本来就是不带关键词的问法。
+    # ---------------------------------------------------------
+    async def search_by_mood(
+        self,
+        query_valence: float = None,
+        query_arousal: float = None,
+        limit: int = None,
+        domain_filter: list[str] = None,
+        include_archive: bool = False,
+    ) -> list[dict]:
+        """按情绪坐标距离排序返回记忆桶（越近越前）。
+
+        两个坐标都给 → 二维欧氏距离；只给一个 → 只在那一个轴上比。
+        两个都不给返回空（调用方不该走到这里）。
+
+        钉选/保护桶不进：它们本来就每次都在「核心准则」里出现，
+        再按心境排一次只会把名额占满。feel 桶也不进，它有自己的入口。
+        每个桶带 mood_distance（原始距离）和 score（0~100，越近越高）。
+        """
+        if query_valence is None and query_arousal is None:
+            return []
+
+        limit = limit or self.max_results
+        all_buckets = await self.list_all(include_archive=include_archive)
+        if not all_buckets:
+            return []
+
+        if domain_filter:
+            filter_set = {d.lower() for d in domain_filter}
+            scoped = [
+                b for b in all_buckets
+                if {d.lower() for d in b["metadata"].get("domain", [])} & filter_set
+            ]
+            # 预筛为空则回退全量（与 search() 同口径）
+            all_buckets = scoped or all_buckets
+
+        max_dist = math.sqrt(2) if (query_valence is not None and query_arousal is not None) else 1.0
+        scored = []
+        for bucket in all_buckets:
+            meta = bucket.get("metadata", {})
+            if meta.get("type") == "feel" or meta.get("pinned") or meta.get("protected"):
+                continue
+            try:
+                b_valence = float(meta.get("valence", 0.5))
+                b_arousal = float(meta.get("arousal", 0.3))
+            except (ValueError, TypeError):
+                continue
+
+            dv = 0.0 if query_valence is None else (query_valence - b_valence)
+            da = 0.0 if query_arousal is None else (query_arousal - b_arousal)
+            dist = math.sqrt(dv * dv + da * da)
+
+            bucket["mood_distance"] = round(dist, 4)
+            bucket["score"] = round(max(0.0, 1.0 - dist / max_dist) * 100, 2)
+            scored.append(bucket)
+
+        # 距离相同时（情绪坐标只有一位小数，撞车很常见）让近期的排前面
+        scored.sort(key=lambda b: (
+            b["mood_distance"],
+            -self._calc_time_score(b["metadata"]),
+        ))
         return scored[:limit]
 
     # ---------------------------------------------------------
