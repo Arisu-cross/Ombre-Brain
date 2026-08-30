@@ -55,11 +55,15 @@ from mcp.server.fastmcp import FastMCP
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
+from digest_engine import DigestEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
 from datetime import timedelta, datetime, date
+
+# 矛盾检测的退化通道要拿正文对正文比字面相似度
+from rapidfuzz import fuzz
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -136,8 +140,11 @@ CONFLICT_CHECK_N = int(os.environ.get("CONFLICT_CHECK_N", "3") or "3")
 # 相似度门槛:只有够像的桶才拿来比。调低会误报泛滥(两件不相干的事各有各的日期,
 # 一比一个"矛盾"),这就是为什么这个值定得比检索用的 0.5 高得多。
 CONFLICT_MIN_SIM = float(os.environ.get("CONFLICT_MIN_SIM", "0.78") or "0.78")
-# 向量通道不可用时的退化门槛:按关键词 search 的百分制分数取(满分100)。
-CONFLICT_KEYWORD_MIN = float(os.environ.get("CONFLICT_KEYWORD_MIN", "80") or "80")
+# 向量通道不可用时的退化门槛:两段正文的**字面相似度**(rapidfuzz,0~1)。
+# 不能拿 search() 的百分制分数或 _calc_topic_score 当门槛 —— 那些是「查询词
+# 对整个桶(名字/域/标签/正文加权)」的分,「同一句话只差一个日期」也只有 0.35,
+# 拿它卡门槛会把真冲突全漏掉。这里要的是正文对正文,所以直接比两段文本。
+CONFLICT_KEYWORD_MIN = float(os.environ.get("CONFLICT_KEYWORD_MIN", "0.75") or "0.75")
 # 一次 hold 最多做几次 LLM 核对(每次一个 API 调用,控制成本和延迟)。
 CONFLICT_MAX_LLM = int(os.environ.get("CONFLICT_MAX_LLM", "2") or "2")
 # --- 新桶自动关联 / auto-link on hold ---
@@ -173,6 +180,7 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 backup_engine = BackupEngine(config, bucket_mgr)     # Daily backup engine / 每日备份引擎
+digest_engine = DigestEngine(config, bucket_mgr, embedding_engine, dehydrator)  # Auto-digest / 自动消化引擎
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -391,6 +399,12 @@ async def health_check(request):
         await backup_engine.ensure_started()
     except Exception as e:
         logger.warning(f"Backup scheduler start failed / 备份调度启动失败: {e}")
+    # 消化引擎的定期扫描同理懒启动。默认只演习+记日志，不动数据
+    # （真要放手整理得显式设 DIGEST_AUTO_EXECUTE=1）。
+    try:
+        await digest_engine.ensure_started()
+    except Exception as e:
+        logger.warning(f"Digest scanner start failed / 消化扫描启动失败: {e}")
     try:
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
@@ -628,7 +642,8 @@ async def _conflict_candidates(content: str, domain: list) -> list[dict]:
     for b in matches:
         if len(picked) >= CONFLICT_CHECK_N:
             break
-        if b.get("score", 0) < CONFLICT_KEYWORD_MIN:
+        old_body = (b.get("content", "") or "")[:2000]
+        if fuzz.ratio(content[:2000], old_body) / 100.0 < CONFLICT_KEYWORD_MIN:
             continue
         if b["metadata"].get("type") == "feel" or _is_expired(b["metadata"]):
             continue
@@ -2284,6 +2299,55 @@ async def trace(
 # Tool 5: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
+@mcp.tool()
+async def digest(execute: bool = False, max_groups: int = 0) -> str:
+    """把长期没被想起的低重要度碎片按语义分组,提炼成沉淀摘要桶。**默认只演习**。
+
+    不传参 = 演习:只输出整理计划(哪几组、每组哪些桶、闲置多久),不动任何数据。
+    execute=True 才真的整理:每组提炼成一条沉淀摘要桶,原桶**归档不删**(随时能捞回来),
+    并互相写上关联。max_groups 限制这一轮最多整理几组(0=用默认上限)。
+    钉选/保护/永久/feel/便利贴/带未处理触发日期的桶一律不参与。
+    """
+    await decay_engine.ensure_started()
+
+    if not execute:
+        plan = await digest_engine.plan()
+        if not plan.get("groups"):
+            return (f"演习:够条件的候选桶 {plan.get('candidates', 0)} 个,"
+                    f"没有能成组的。{plan.get('note', '')}")
+        lines = [
+            f"=== 消化演习(没有改动任何记忆)===",
+            f"候选桶 {plan['candidates']} 个,分组方式:{plan['method']},"
+            f"本轮可整理 {len(plan['groups'])} 组",
+        ]
+        for i, g in enumerate(plan["groups"], 1):
+            lines.append(f"\n第 {i} 组({g['size']} 条 → 1 条沉淀摘要)"
+                         f" 主题:{','.join(g['domains']) or '-'}")
+            if g["tags"]:
+                lines.append(f"  共同标签:{','.join(g['tags'])}")
+            for b in g["buckets"]:
+                lines.append(f"  · [{b['id']}] {b['name']}"
+                             f"(重要度{b['importance']},闲置{b['idle_days']}天)")
+        lines.append("\n确认无误后用 digest(execute=True) 实际整理;原桶只归档不删除。")
+        return "\n".join(lines)
+
+    result = await digest_engine.execute(max_groups=max_groups or None)
+    if result.get("error"):
+        return f"没有执行:{result['error']}"
+    if not result.get("groups"):
+        return f"候选桶 {result.get('candidates', 0)} 个,没有能成组的,什么都没做。"
+
+    lines = [f"=== 消化完成:{result['digested']}/{len(result['groups'])} 组 ==="]
+    for g in result["groups"]:
+        if g.get("ok"):
+            lines.append(f"✅ 沉淀→[{g['sediment_id']}] {g.get('name', '')} "
+                         f"(合了 {len(g['sources'])} 条,原桶已归档:{len(g.get('archived', []))})")
+        else:
+            lines.append(f"⏭️ 跳过一组({len(g.get('sources', []))} 条):{g.get('reason', '')}")
+    lines.append("原桶都在 archive/ 里,要捞回来用 trace 或面板恢复。")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。默认只显示全部钉选桶+非钉选桶随机抽样5个(每次调用结果不同),末尾附统计;show_all=True显示全部桶。"""

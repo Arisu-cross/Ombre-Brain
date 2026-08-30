@@ -173,6 +173,7 @@ def mock_embedding_engine():
     ee.search_within = AsyncMock(return_value=None)
     ee.delete_embedding = AsyncMock(return_value=True)
     ee.get_embedding = AsyncMock(return_value=None)
+    ee.find_similar_buckets = AsyncMock(return_value=[])
     return ee
 
 
