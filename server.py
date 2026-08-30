@@ -2766,6 +2766,93 @@ async def dashboard(request):
         return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
 
 
+# =============================================================
+# 记忆银河 / Memory Galaxy(2026-08-29)
+#
+# 把记忆库渲染成一片可穿梭的 3D 星系:一条记忆一颗星,created 决定它离银河
+# 中心多远(最早的那条就是核心),importance/pinned 决定大小亮度,domain 决定颜色。
+# 页面是 galaxy.html,数据走下面的 /api/galaxy——所以不用导出脚本、不用 cron,
+# 新存的记忆下次打开就是新的一颗星。
+#
+# 鉴权:数据接口和面板共用一把锁(_require_auth);页面本身不鉴权,拿不到数据时
+# 前端自己跳去 /dashboard 登录。真实记忆不落进仓库,只在运行时从卷里读。
+# =============================================================
+
+@mcp.custom_route("/galaxy", methods=["GET"])
+async def galaxy_page(request):
+    """Serve the memory galaxy page. / 记忆银河页面。"""
+    from starlette.responses import HTMLResponse
+    galaxy_path = os.path.join(os.path.dirname(__file__), "galaxy.html")
+    try:
+        with open(galaxy_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    except FileNotFoundError:
+        return HTMLResponse("<h1>galaxy.html not found</h1>", status_code=404)
+
+
+@mcp.custom_route("/api/galaxy", methods=["GET"])
+async def api_galaxy(request):
+    """
+    Memory data for the galaxy page: one star per bucket.
+    银河页面的数据源:一条记忆一颗星。
+
+    Query params:
+      archive=0   不要会话归档(默认要:归档是 importance 4 的小星,构成日常的底色)
+      min=N       只要 importance >= N 的记忆
+    """
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        include_archive = request.query_params.get("archive") not in ("0", "false", "no")
+        try:
+            min_imp = int(request.query_params.get("min", "0"))
+        except ValueError:
+            min_imp = 0
+
+        all_buckets = await bucket_mgr.list_all(include_archive=include_archive)
+        stars = []
+        for b in all_buckets:
+            meta = b.get("metadata", {})
+            importance = meta.get("importance", 5)
+            if importance < min_imp:
+                continue
+            content = strip_wikilinks(b.get("content", "")).strip()
+
+            # domain 是列表,取第一个当颜色;feel 桶没有 domain,归到「情绪」
+            domains = meta.get("domain") or []
+            domain = domains[0] if domains else ("情绪" if meta.get("type") == "feel" else "未分类")
+
+            # feel 桶的 name 是一串 id,没有可读标题——留空让前端拿正文开头当标题
+            name = (meta.get("name") or "").strip()
+            if name == b["id"]:
+                name = ""
+
+            stars.append({
+                "id": b["id"],
+                "name": name,
+                "domain": domain,
+                "importance": importance,
+                "pinned": bool(meta.get("pinned") or meta.get("protected")),
+                "created": meta.get("created", ""),
+                "content": content,
+            })
+
+        stars.sort(key=lambda x: x["created"])
+        return JSONResponse({
+            "config": {
+                "title": os.getenv("GALAXY_TITLE", ""),
+                "subtitle": os.getenv("GALAXY_SUBTITLE", ""),
+                "motto": os.getenv("GALAXY_MOTTO", ""),
+                "coreEn": os.getenv("GALAXY_CORE_EN", ""),
+            },
+            "count": len(stars),
+            "stars": stars,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/config", methods=["GET"])
 async def api_config_get(request):
     """Get current runtime config (safe fields only, API key masked)."""

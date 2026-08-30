@@ -20,6 +20,10 @@
 | `OMBRE_UTC_OFFSET` | 否 | `8` | 记忆时间戳的 UTC 偏移小时数（默认北京时间）。容器多为 UTC，不设的话后半夜的记忆会被记成前一天 |
 | `OMBRE_STATELESS` | 否 | `1` | streamable-http 无状态模式 + JSON 响应：每次调用独立请求，服务器重启后旧客户端连接依然可用（常驻型客户端不再需要重启进程）。设 `0` 恢复有状态会话 |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 | — | 预设 Dashboard 访问密码；设置后覆盖文件存储的密码，首次访问不弹设置向导 |
+| `GALAXY_TITLE` | 否 | — | 记忆银河页面（`/galaxy`）的大标题，覆盖 `galaxy.html` 里的 CONFIG，改完重启即可，不用改代码 |
+| `GALAXY_SUBTITLE` | 否 | — | 记忆银河的英文副标题 |
+| `GALAXY_MOTTO` | 否 | — | 记忆银河标题下的中文小字 |
+| `GALAXY_CORE_EN` | 否 | — | 点开核心星（最早那条记忆）时，卡片标题下的英文小字 |
 | `OMBRE_DEHYDRATION_MODEL` | 否 | `deepseek-chat` | 脱水/打标/合并/拆分用的 LLM 模型名（覆盖 `dehydration.model`） |
 | `OMBRE_DEHYDRATION_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 脱水模型的 API Base URL（覆盖 `dehydration.base_url`） |
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
