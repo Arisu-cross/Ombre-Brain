@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files / 复制项目文件
 COPY *.py .
-COPY dashboard.html .
-COPY galaxy.html .
+# 页面一次性全拷 —— 逐个 COPY 时新加的文件容易在构建缓存里被漏掉
+# (2026-08-29 就踩过:线上 dashboard 是新的,galaxy.html 却没进镜像)
+COPY *.html ./
 COPY config.example.yaml ./config.yaml
 
 # Persistent mount point: bucket data
