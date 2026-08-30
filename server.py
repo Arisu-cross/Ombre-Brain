@@ -2780,14 +2780,16 @@ async def dashboard(request):
 
 @mcp.custom_route("/galaxy", methods=["GET"])
 async def galaxy_page(request):
-    """Serve the memory galaxy page. / 记忆银河页面。"""
+    """
+    Serve the memory galaxy page. / 记忆银河页面。
+
+    页面存在 galaxy_page.py 里而不是一个 .html 文件 —— Zeabur 的自动部署会沿用
+    缓存的旧构建计划(旧 Dockerfile 逐个 COPY xxx.html),新增的 .html 进不了镜像;
+    而 `COPY *.py .` 新旧计划都有。原因写在 galaxy_page.py 顶部。
+    """
     from starlette.responses import HTMLResponse
-    galaxy_path = os.path.join(os.path.dirname(__file__), "galaxy.html")
-    try:
-        with open(galaxy_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
-    except FileNotFoundError:
-        return HTMLResponse("<h1>galaxy.html not found</h1>", status_code=404)
+    from galaxy_page import GALAXY_HTML
+    return HTMLResponse(GALAXY_HTML)
 
 
 @mcp.custom_route("/api/galaxy", methods=["GET"])

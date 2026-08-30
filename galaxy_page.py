@@ -1,4 +1,20 @@
-<!DOCTYPE html>
+"""
+Memory Galaxy page / 记忆银河页面
+
+为什么这一页是 .py 而不是 .html
+------------------------------------------------------------------
+Zeabur 的自动部署会沿用**缓存下来的构建计划**(旧 Dockerfile),而旧
+Dockerfile 里是逐个 `COPY xxx.html` —— 结果就是:改过的老文件能进镜像,
+这次新增的 `galaxy.html` 永远进不去,线上一直报 "galaxy.html not found"。
+(2026-08-29 排查记录见 ob-backup/SYSTEM-HANDBOOK.md §10。)
+
+旧构建计划里有 `COPY *.py .` 这一行,所以把页面放进一个 .py 模块,
+无论 Zeabur 用的是新计划还是旧计划都能到位,不必每次改完再去手动强制重部署。
+
+改页面就直接改下面这段 HTML —— 它就是原来的 galaxy.html,一字未动。
+"""
+
+GALAXY_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -538,3 +554,4 @@ fetch(CONFIG.dataUrl+'?d='+Date.now(),{credentials:'same-origin'}).then(r=>{
 </script>
 </body>
 </html>
+"""
