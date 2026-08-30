@@ -1333,7 +1333,7 @@ async def breath(
     wake: bool = False,
     startup: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它按 env BREATH_WAKE_BUDGET,默认10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会按「## HH:MM」分节裁、保最近几节并标注(env BREATH_RAW_MAX_TOKENS,设0=不限)。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
+    """检索/浮现记忆。不传query或传空=返回钉选桶+最近归档的会话总结(archive_session写入,按归档时间降序,默认2-5条)+最近记下的动态桶(hold写入,按活跃时间降序,默认3条,env BREATH_RECENT_N可调/设0关闭);不触发Dreaming,不带feel;有query=语义浮现(关键词+向量检索,返回匹配结果)。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,无query/其它按 env BREATH_WAKE_BUDGET,默认10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略):有query时它们是四维评分里的情感共鸣维;**不带query只给坐标=心境共鸣模式**,不看文本、只按各桶情绪坐标与传入坐标的距离排序返回(可与domain/date_from/date_to/importance_min/max_results组合;钉选桶和feel不进这条通道)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,无query/wake/startup时最近归档取2-5条,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary每桶只返回单行摘要省token,mode=full返回脱水全文,mode=raw返回原文不做二次压缩;不传时:唤醒/无query浮现的归档与最近记下默认raw(原文——归档本就是写给下一个自己的信,再脱水会磨平语气细节),其余默认summary;query非空时忽略mode始终返回full。单条原文超限会按「## HH:MM」分节裁、保最近几节并标注(env BREATH_RAW_MAX_TOKENS,设0=不限)。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。wake=True或startup=True时触发"唤醒模式":忽略query/domain等检索参数,返回钉选桶+最近归档桶(按归档时间降序,默认2-5条,可用max_results显式调整条数)+最近记下的动态桶;唤醒不触发Dreaming、不带feel——dream()和breath(domain=\"feel\")需要时单独调用。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -1446,6 +1446,72 @@ async def breath(
             },
         )
         return "\n\n".join(parts)
+
+    # --- Mood-only mode: emotion coordinates without a query ---
+    # --- 心境共鸣模式：只给情绪坐标、不给关键词，按坐标距离排序 ---
+    # 「现在这个心情，让我想起过什么」——这个问法本来就没有关键词。
+    # 有 query 时不走这里：那时情绪坐标仍是四维评分里的一维（老行为不变）。
+    q_valence_only = valence if 0 <= valence <= 1 else None
+    q_arousal_only = arousal if 0 <= arousal <= 1 else None
+    if (q_valence_only is not None or q_arousal_only is not None) and not (query or "").strip():
+        try:
+            mood_matches = await bucket_mgr.search_by_mood(
+                query_valence=q_valence_only,
+                query_arousal=q_arousal_only,
+                limit=max_results if not auto_results else 50,
+                domain_filter=[d.strip() for d in domain.split(",") if d.strip()] or None,
+            )
+        except Exception as e:
+            logger.error(f"Mood search failed / 心境检索失败: {e}")
+            return "按心境检索时出错，请稍后重试。"
+
+        # 可与现有检索参数组合：日期区间 / 重要度下限 / 休眠桶
+        mood_matches = [
+            b for b in mood_matches
+            if _passes_date_filter(b["metadata"], date_from, date_to)
+            and (include_dormant or not b["metadata"].get("dormant"))
+            and not _is_expired(b["metadata"])
+            and (importance_min < 1
+                 or int(b["metadata"].get("importance", 0)) >= importance_min)
+        ]
+        if not mood_matches:
+            return "没有情绪坐标接近的记忆。"
+
+        coord = []
+        if q_valence_only is not None:
+            coord.append(f"V{q_valence_only:.2f}")
+        if q_arousal_only is not None:
+            coord.append(f"A{q_arousal_only:.2f}")
+        results = []
+        token_used = 0
+        for b in mood_matches:
+            if token_used >= max_tokens:
+                break
+            try:
+                meta = b["metadata"]
+                if mode == "summary":
+                    entry = _summary_line(b, prefix="🎭 [心境共鸣] ")
+                else:
+                    clean_meta = {k: v for k, v in meta.items() if k != "tags"}
+                    body = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    entry = f"🎭 [心境共鸣] [bucket_id:{b['id']}] {body}"
+                entry += (f"\n  ↳ 情感坐标 V{float(meta.get('valence', 0.5)):.1f}"
+                          f"/A{float(meta.get('arousal', 0.3)):.1f}"
+                          f" 距离 {b['mood_distance']:.2f}")
+                entry_tokens = count_tokens_approx(entry)
+                if token_used + entry_tokens > max_tokens and results:
+                    break
+                results.append(entry)
+                token_used += entry_tokens
+            except Exception as e:
+                logger.warning(f"Mood entry render failed / 心境条目渲染失败: {e}")
+                continue
+
+        if not results:
+            return "没有情绪坐标接近的记忆。"
+        await _fire_webhook("breath", {"mode": "mood", "matches": len(results)})
+        header = f"=== 心境共鸣({'/'.join(coord)},按情绪坐标距离排序)==="
+        return header + "\n" + "\n---\n".join(results)
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
