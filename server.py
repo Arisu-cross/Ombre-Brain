@@ -3401,6 +3401,69 @@ async def api_breath_debug(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =============================================================
+# 桌面图标 / 添加到主屏幕(2026-08-31)
+#
+# 栖栖只有手机:她把 /dashboard 用 Safari「添加到主屏幕」之后,iOS 会来抓
+# apple-touch-icon 指的那张 PNG 当图标。图和 manifest 都在 app_icon.py 里
+# (base64,不是几个 .png 文件 —— 理由见那个文件顶部:Zeabur 构建计划缓存)。
+#
+# 这几个口子**不鉴权**:图标和 manifest 里没有任何记忆内容,而 iOS 抓图标时
+# 不一定带 cookie,要鉴权就会变成默认的灰色截图图标。
+# =============================================================
+
+def _icon_response(size: int):
+    from starlette.responses import Response
+    from app_icon import ICONS
+    return Response(
+        ICONS[size],
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
+@mcp.custom_route("/icon-180.png", methods=["GET"])
+async def icon_180(request):
+    """iPhone 桌面图标(iOS 真正会用的那张)。"""
+    return _icon_response(180)
+
+
+@mcp.custom_route("/icon-192.png", methods=["GET"])
+async def icon_192(request):
+    """PWA manifest 用。"""
+    return _icon_response(192)
+
+
+@mcp.custom_route("/icon-512.png", methods=["GET"])
+async def icon_512(request):
+    """PWA manifest 用(大图 / 启动画面)。"""
+    return _icon_response(512)
+
+
+@mcp.custom_route("/icon-32.png", methods=["GET"])
+async def icon_32(request):
+    """浏览器标签页小图标。"""
+    return _icon_response(32)
+
+
+@mcp.custom_route("/favicon.ico", methods=["GET"])
+async def favicon(request):
+    """老浏览器会直接要 /favicon.ico —— 给它同一张 32px 的 PNG。"""
+    return _icon_response(32)
+
+
+@mcp.custom_route("/manifest.webmanifest", methods=["GET"])
+async def web_manifest(request):
+    """PWA manifest:决定加到主屏后的名字、底色、是否全屏。"""
+    from starlette.responses import JSONResponse
+    from app_icon import WEB_MANIFEST
+    return JSONResponse(
+        WEB_MANIFEST,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard(request):
     """Serve the dashboard HTML page."""
