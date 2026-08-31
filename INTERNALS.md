@@ -150,6 +150,11 @@
 | `/breath-hook` | GET | SessionStart 钩子 |
 | `/dream-hook` | GET | Dream 钩子（端点保留；SessionStart 钩子不再自动调用，唤醒不做梦） |
 | `/dashboard` | GET | Dashboard 页面 |
+| `/galaxy` | GET | 记忆银河页面（页面本身不鉴权，数据走 `/api/galaxy` 🔒）|
+| `/icon-180.png` | GET | iOS 桌面图标（`apple-touch-icon`）|
+| `/icon-192.png` `/icon-512.png` | GET | PWA manifest 用的图标 |
+| `/icon-32.png` `/favicon.ico` | GET | 标签页小图标 |
+| `/manifest.webmanifest` | GET | PWA manifest（名字/底色/standalone）|
 | `/api/buckets` | GET | 桶列表 🔒 |
 | `/api/bucket/{id}` | GET | 桶详情（`?raw=1` 保留 `[[双链]]`，编辑器用）🔒 |
 | `/api/bucket/{id}` | POST | 面板编辑：改内容/名字/标签/域/重要度/valence/arousal/pinned/resolved/digested，其余字段不可改 🔒 |
@@ -183,6 +188,17 @@
 - 环境变量 `OMBRE_DASHBOARD_PASSWORD` 设置后，覆盖文件密码（只读，不可通过 Dashboard 修改）
 - Session：内存字典（服务重启失效），cookie `ombre_session`（HttpOnly, SameSite=Lax, 7天）
 - `/health`, `/breath-hook`, `/dream-hook`, `/mcp*` 路径不受保护（公开）
+
+**添加到主屏幕（iOS / Android）**
+- 图标与 manifest 都在 `app_icon.py` 里（base64 PNG，不是 `.png` 文件）——
+  和 `galaxy_page.py` 同一个理由：Zeabur 会沿用缓存的旧构建计划，新增的二进制文件
+  进不了镜像。改图就换那几段 base64。
+- 图标路由与 `/manifest.webmanifest` **不鉴权**：里面没有任何记忆内容，而 iOS 抓
+  `apple-touch-icon` 时不一定带 cookie，鉴权会让它退回成灰色网页截图。
+- 面板是浅色页：`apple-mobile-web-app-status-bar-style` 用 `default`（黑字状态栏）；
+  银河页是深色，用 `black-translucent`。
+- `.header` / `.content` 用 `env(safe-area-inset-*)` 让开刘海和底部横条 —— 这段 CSS
+  必须排在手机版 `@media` 之后才生效。
 
 **Dashboard（6 个 Tab）**
 1. 记忆桶列表：6 种过滤器 + 主题域过滤 + 搜索 + 详情面板

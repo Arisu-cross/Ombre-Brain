@@ -2,7 +2,29 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+
+<!-- ══════════════════════════════════════════════════════════
+     添加到主屏幕(2026-08-31)
+     Safari →「分享」→「添加到主屏幕」之后,iOS 拿下面这张
+     apple-touch-icon 当桌面图标,按 standalone 全屏打开(没有地址栏)。
+     图和 manifest 由 app_icon.py 提供,走 /icon-*.png、
+     /manifest.webmanifest —— 都不鉴权,里面没有任何记忆内容。
+     ══════════════════════════════════════════════════════════ -->
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<!-- 面板是浅色的:状态栏要用 default(黑字、内容从状态栏下面开始)。
+     用 black-translucent 会变成白字压在白底上 = 时间和信号看不见。 -->
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Ombre">
+<meta name="application-name" content="Ombre">
+<!-- 页面的 theme-color 跟面板同色(Safari 工具栏会染成这个);
+     manifest 里另给深蓝,那是启动图/图标底色。 -->
+<meta name="theme-color" content="#F4F8FF">
 <title>Ombre Brain</title>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -824,6 +846,28 @@
     .breath-controls button { grid-column: 1 / -1; justify-self: stretch; }
     .breath-info { padding: 14px 16px; }
     #network-canvas { height: calc(100vh - 260px); }
+  }
+
+
+  /* ══════════════════════════════════════════════════════════
+     加到主屏之后是全屏 app:顶上有状态栏/刘海、底下有横条。
+     不给安全区留位置的话,标题会被状态栏盖住、最后一条记忆
+     会压在横条底下。这一段必须排在手机版 @media 之后才生效。
+     ══════════════════════════════════════════════════════════ */
+  .header {
+    padding-top: calc(18px + env(safe-area-inset-top, 0px));
+    padding-left: calc(32px + env(safe-area-inset-left, 0px));
+    padding-right: calc(32px + env(safe-area-inset-right, 0px));
+  }
+  .content { padding-bottom: calc(32px + env(safe-area-inset-bottom, 0px)); }
+
+  @media (max-width: 768px) {
+    .header {
+      padding-top: calc(14px + env(safe-area-inset-top, 0px));
+      padding-left: calc(16px + env(safe-area-inset-left, 0px));
+      padding-right: calc(16px + env(safe-area-inset-right, 0px));
+    }
+    .content { padding-bottom: calc(40px + env(safe-area-inset-bottom, 0px)); }
   }
 
 </style>

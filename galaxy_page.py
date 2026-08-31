@@ -20,6 +20,13 @@ GALAXY_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#050209">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Galaxy">
 <title>Memory · 记忆银河</title>
 <link href="https://cdn.jsdelivr.net/npm/@fontsource/cormorant-garamond@5/400-italic.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/@fontsource/playfair-display@5/600-italic.min.css" rel="stylesheet">
