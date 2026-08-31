@@ -56,6 +56,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from digest_engine import DigestEngine
+from maintenance import backfill_mood, backfill_related
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
@@ -387,6 +388,85 @@ async def root_redirect(request):
     return RedirectResponse(url="/dashboard")
 
 
+# =============================================================
+# 开机自跑一次的存量维护
+#
+# 栖栖只有手机、进不了容器 —— 让她「去服务器上跑个脚本」等于这两件事永远不会发生。
+# 所以服务端自己做一次:补情绪坐标(心境检索要用)、补关联(孤岛桶连上邻居)。
+#
+# 三重保险:
+#   1. 结果写进 {buckets_dir}/.maintenance.json,**每个任务一辈子只跑一次**
+#      （标记文件在持久卷上，重新部署不会重跑）
+#   2. 出任何错都只记日志:维护失败绝不能影响服务本身
+#   3. OMBRE_STARTUP_MAINTENANCE=0 可整个关掉
+#
+# 两个任务都是幂等的:补过的跳过、已有关联的不覆盖。
+# =============================================================
+STARTUP_MAINTENANCE = os.environ.get("OMBRE_STARTUP_MAINTENANCE", "1") != "0"
+_MAINTENANCE_TASKS = ("mood", "related")
+_maintenance_lock = asyncio.Lock()
+_maintenance_done = False
+
+
+def _maintenance_state_path() -> str:
+    return os.path.join(config["buckets_dir"], ".maintenance.json")
+
+
+def _load_maintenance_state() -> dict:
+    try:
+        with open(_maintenance_state_path(), encoding="utf-8") as f:
+            return _json_lib.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_maintenance_state(state: dict) -> None:
+    try:
+        with open(_maintenance_state_path(), "w", encoding="utf-8") as f:
+            _json_lib.dump(state, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning(f"Maintenance state save failed / 维护标记写入失败: {e}")
+
+
+async def _run_startup_maintenance() -> None:
+    """跑一次存量维护(每个任务只跑一次)。任何异常都只记日志。"""
+    global _maintenance_done
+    if not STARTUP_MAINTENANCE or _maintenance_done:
+        return
+    async with _maintenance_lock:
+        if _maintenance_done:
+            return
+        state = _load_maintenance_state()
+        if all(t in state for t in _MAINTENANCE_TASKS):
+            _maintenance_done = True
+            return
+
+        for task, runner in (
+            ("mood", lambda: backfill_mood(bucket_mgr, dehydrator)),
+            ("related", lambda: backfill_related(bucket_mgr, embedding_engine)),
+        ):
+            if task in state:
+                continue
+            try:
+                stats = await runner()
+            except Exception as e:
+                logger.error(f"Startup maintenance ({task}) failed / 存量维护失败: {e}")
+                continue
+            # 引擎当时不可用(缺 key / embedding 没开)不算「做过了」——
+            # 落了标记就再也不会重试,那件事等于永远没做。下次启动再来一遍。
+            if stats.get("error"):
+                logger.warning(f"Startup maintenance ({task}) skipped / 跳过,下次再试: {stats['error']}")
+                continue
+            stats["at"] = now_iso()
+            state[task] = stats
+            logger.info(f"Startup maintenance ({task}) / 存量维护完成: {stats}")
+
+        if state:
+            _save_maintenance_state(state)
+        if all(t in state for t in _MAINTENANCE_TASKS):
+            _maintenance_done = True
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import JSONResponse
@@ -405,14 +485,26 @@ async def health_check(request):
         await digest_engine.ensure_started()
     except Exception as e:
         logger.warning(f"Digest scanner start failed / 消化扫描启动失败: {e}")
+    # 存量维护:补情绪坐标 + 补关联，一辈子只跑一次（见 _run_startup_maintenance）。
+    # 放后台跑，不拖慢 /health —— 保活循环每 60 秒 ping 一次，超时会被当成服务挂了。
+    if STARTUP_MAINTENANCE and not _maintenance_done:
+        asyncio.create_task(_run_startup_maintenance())
     try:
         stats = await bucket_mgr.get_stats()
-        return JSONResponse({
+        body = {
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
             "backup_scheduler": "running" if backup_engine.is_running else "stopped",
-        })
+        }
+        # 只报数字，不报任何记忆内容：这是公开端点
+        mstate = _load_maintenance_state()
+        if mstate:
+            body["maintenance"] = {
+                k: {kk: vv for kk, vv in v.items() if kk != "dry_run"}
+                for k, v in mstate.items() if isinstance(v, dict)
+            }
+        return JSONResponse(body)
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 

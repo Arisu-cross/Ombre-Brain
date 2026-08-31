@@ -200,7 +200,7 @@
 5. Zeabur 部署（`zbpack.json`）
 6. GitHub Actions 自动构建推送 Docker Hub（`.github/workflows/docker-publish.yml`）
 
-**迁移/批处理工具**：`migrate_to_domains.py`、`reclassify_domains.py`、`reclassify_api.py`、`backfill_embeddings.py`、`backfill_mood.py`（补情绪坐标）、`backfill_related.py`（补关联）、`write_memory.py`、`check_buckets.py`、`import_memory.py`（历史对话导入引擎）
+**迁移/批处理工具**：`migrate_to_domains.py`、`reclassify_domains.py`、`reclassify_api.py`、`backfill_embeddings.py`、`backfill_mood.py`（补情绪坐标）、`backfill_related.py`（补关联）。后两个的核心逻辑在 `maintenance.py`，服务端**开机也会自己跑一次**（结果写 `{buckets_dir}/.maintenance.json`，每个任务一辈子只跑一次；引擎当时不可用则不落标记、下次启动重试；数字摘要出现在 `/health` 的 `maintenance` 字段）、`write_memory.py`、`check_buckets.py`、`import_memory.py`（历史对话导入引擎）
 
 **降级策略**
 - 脱水 API 不可用 → 直接抛 RuntimeError（设计决策，详见 BEHAVIOR_SPEC.md 三、降级行为表）
@@ -224,6 +224,7 @@
 | `OMBRE_HOOK_URL` | SessionStart 钩子调用的服务器 URL | 否 | `"http://localhost:8000"` |
 | `OMBRE_HOOK_SKIP` | 设为 `"1"` 跳过 SessionStart 钩子 | 否 | 未设置（不跳过） |
 | `OMBRE_DASHBOARD_PASSWORD` | 预设 Dashboard 访问密码；设置后覆盖文件密码，首次访问不弹设置向导 | 否 | `""` |
+| `OMBRE_STARTUP_MAINTENANCE` | 开机自跑一次的存量维护（补情绪坐标 + 补关联）；`0` = 关掉 | 否 | `1` |
 | `CONFLICT_CHECK_N` | 存入时最多捞几条旧桶做矛盾比对；`0` = 关闭矛盾检测 | 否 | `3` |
 | `CONFLICT_MIN_SIM` | 矛盾比对的向量相似度门槛（调低 → 误报泛滥）| 否 | `0.78` |
 | `CONFLICT_KEYWORD_MIN` | 向量不可用时的退化门槛：正文对正文的字面相似度 | 否 | `0.75` |
