@@ -3258,17 +3258,28 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        matches = await bucket_mgr.search(query, limit=30)
         result = []
         for b in matches:
             meta = b.get("metadata", {})
+            # 面板的搜索结果和记忆列表用同一套卡片来画,所以这里要给齐同样的字段。
+            # 少给的后果是可见的:2026-08-31 前这里没有 last_active/type/importance,
+            # 搜索结果的时间就成了一个「—」,月相和「心情」标记也全退化。
             result.append({
                 "id": b["id"],
                 "name": meta.get("name", b["id"]),
                 "score": b.get("score", 0),
+                "type": meta.get("type", "dynamic"),
                 "domain": meta.get("domain", []),
+                "tags": meta.get("tags", []),
                 "valence": meta.get("valence", 0.5),
                 "arousal": meta.get("arousal", 0.3),
+                "importance": meta.get("importance", 5),
+                "pinned": meta.get("pinned", False),
+                "resolved": meta.get("resolved", False),
+                "digested": meta.get("digested", False),
+                "created": meta.get("created", ""),
+                "last_active": meta.get("last_active", ""),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
         return JSONResponse(result)
