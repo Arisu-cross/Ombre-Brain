@@ -1526,7 +1526,15 @@ function filterBuckets(buckets) {
   if (currentFilter === 'feel') return buckets.filter(function(b) { return b.type === 'feel'; });
   if (currentFilter === 'unresolved') return buckets.filter(function(b) { return !b.resolved && b.type !== 'permanent' && !b.pinned; });
   if (currentFilter === 'digested') return buckets.filter(function(b) { return b.digested; });
-  if (currentFilter === 'archived') return buckets.filter(function(b) { return b.type === 'archived' || b.score < 0.3; });
+  // 归档是会话档案,翻它是为了顺着日子往回看,不是看谁分高。
+  // 按「记录的日子」(created)从新到旧排 —— 不用 last_active:那是「最近被想起」,
+  // 真实数据里 87 条归档有 79 条两者不是同一天,拿它排出来的顺序不是日记的顺序。
+  if (currentFilter === 'archived') {
+    return buckets
+      .filter(function(b) { return b.type === 'archived' || b.score < 0.3; })
+      .slice()
+      .sort(function(a, b) { return dayKey(b) - dayKey(a); });
+  }
   if (currentFilter.startsWith('domain:')) {
     var d = currentFilter.slice(7);
     return buckets.filter(function(b) { return (b.domain || []).includes(d); });
@@ -1611,14 +1619,25 @@ function rowMark(b) {
   return '';
 }
 
+// 归档视图里时间显示成「7 月 8 日」而不是「2 个月前」 —— 顺着日子往回翻的时候,
+// 相对时间说不清「依次顺延」到哪儿了。排序用的也是这个日子,看到的即排的。
+function isArchiveView() { return currentFilter === 'archived'; }
+
+function dayKey(b) {
+  var d = new Date(b.created || b.last_active || 0);
+  return isNaN(d) ? 0 : d.getTime();
+}
+
 function bucketRow(b) {
   var doms = (b.domain || []).slice(0, 2).map(domTag).join('');
+  var when = isArchiveView() ? fmtDay(b.created || b.last_active)
+                             : formatTimeAgo(b.last_active || b.created);
   return '<div class="bucket-row" onclick="showDetail(\'' + escAttr(b.id) + '\')">' +
     '<span class="icon">' + moonHTML(b) + '</span>' +
     '<span class="name" title="' + escAttr(b.name) + '">' + hi(b.name) + '</span>' +
     '<span class="domain">' + doms + '</span>' +
     '<span class="emotion">' + rowMark(b) + moodHTML(b) + '</span>' +
-    '<span class="time">' + formatTimeAgo(b.last_active || b.created) + '</span>' +
+    '<span class="time">' + when + '</span>' +
     '<span class="preview">' + hi(b.content_preview) + '</span>' +
   '</div>';
 }
@@ -1631,6 +1650,19 @@ function renderBuckets(buckets) {
     list.innerHTML = '<div class="loading">没有记忆桶</div>';
     return;
   }
+  // 归档:按月切段,一个月一个小标题,顺着往下就是往回走的日子
+  if (isArchiveView()) {
+    var html = '', lastMonth = '';
+    buckets.forEach(function(b) {
+      var d = new Date(b.created || b.last_active || 0);
+      var m = isNaN(d) ? '没有日期' : (d.getFullYear() + ' 年 ' + (d.getMonth() + 1) + ' 月');
+      if (m !== lastMonth) { html += '<div class="list-sec">' + m + '</div>'; lastMonth = m; }
+      html += bucketRow(b);
+    });
+    list.innerHTML = html;
+    return;
+  }
+
   var perm = [], rest = [];
   buckets.forEach(function(b) {
     (b.pinned || b.type === 'permanent' ? perm : rest).push(b);
