@@ -3514,6 +3514,20 @@ async def galaxy_page(request):
     return HTMLResponse(GALAXY_HTML)
 
 
+@mcp.custom_route("/flux", methods=["GET"])
+async def flux_page(request):
+    """
+    记忆乱流页面。银河讲时间,乱流讲关系。
+
+    和 galaxy 一样:页面本身不鉴权,数据接口 /api/flux 鉴权;拿不到数据时
+    前端自己提示去 /dashboard 登录。页面存在 flux_page.py 里而不是 .html,
+    理由见那个文件顶部(Zeabur 构建计划缓存)。
+    """
+    from starlette.responses import HTMLResponse
+    from flux_page import FLUX_HTML
+    return HTMLResponse(FLUX_HTML)
+
+
 @mcp.custom_route("/api/galaxy", methods=["GET"])
 async def api_galaxy(request):
     """
@@ -3572,6 +3586,155 @@ async def api_galaxy(request):
             },
             "count": len(stars),
             "stars": stars,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# 记忆乱流 / Memory Flux(2026-08-31)
+#
+# 银河讲的是**时间**(一条记忆一颗星,越早越靠中心);
+# 乱流讲的是**关系** —— 一条记忆一个字,漂在字流里,点一个字就把它牵着的
+# 那些记忆拉出来。它顶掉的是 08-31 砍掉的那个又丑又空的「记忆网络」。
+#
+# 三种关联,全都是库里现成的,不新建任何字段:
+#   related —— frontmatter 的 related 列表(存入时自动关联写的)
+#   tag     —— 共享标签
+#   vector  —— 向量相似度(和 /api/network 同一套 embedding)
+#
+# 为什么要设上限:标签关联会爆炸。「日常」这种标签几十条桶都有,两两连起来
+# 就是几百条线,画出来是一团糊。所以:太泛的标签直接不连,每个节点每种关联
+# 也各自限量。宁可少画几条,也不要一屏毛线。
+# =============================================================
+
+# 一个标签挂在超过这么多条记忆上,就当它是「大类」而不是「关联」,不连线
+FLUX_TAG_MAX_FANOUT = 8
+FLUX_TAG_PER_NODE = 3      # 每条记忆最多牵 3 条标签线
+FLUX_VECTOR_PER_NODE = 3   # 每条记忆最多牵 3 条相似线
+FLUX_VECTOR_MIN_SIM = 0.55
+FLUX_MAX_LINKS = 1500
+
+
+@mcp.custom_route("/api/flux", methods=["GET"])
+async def api_flux(request):
+    """
+    记忆乱流的数据源:节点 + 三种关联。
+
+    Query params:
+      archive=0   不要会话归档(默认要)
+      min=N       只要 importance >= N 的记忆
+    """
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        include_archive = request.query_params.get("archive") not in ("0", "false", "no")
+        try:
+            min_imp = int(request.query_params.get("min", "0"))
+        except ValueError:
+            min_imp = 0
+
+        all_buckets = await bucket_mgr.list_all(include_archive=include_archive)
+
+        nodes = []
+        keep = {}          # id -> meta,方便后面建关联
+        for b in all_buckets:
+            meta = b.get("metadata", {})
+            importance = meta.get("importance", 5)
+            if importance < min_imp:
+                continue
+            bid = b["id"]
+            content = strip_wikilinks(b.get("content", "")).strip()
+            domains = meta.get("domain") or []
+            domain = domains[0] if domains else ("情绪" if meta.get("type") == "feel" else "未分类")
+
+            # feel 桶的 name 是一串 id,没有可读标题 —— 留空,前端拿正文开头顶上
+            name = (meta.get("name") or "").strip()
+            if name == bid:
+                name = ""
+
+            keep[bid] = meta
+            nodes.append({
+                "id": bid,
+                "name": name,
+                "domain": domain,
+                "type": meta.get("type", "dynamic"),
+                "importance": importance,
+                "pinned": bool(meta.get("pinned") or meta.get("protected")),
+                "created": meta.get("created", ""),
+                "tags": (meta.get("tags") or [])[:8],
+                "content": content[:400],
+            })
+
+        ids = set(keep.keys())
+        links = {}   # (low, high) -> {"kind", "label"}
+        # 同一对记忆只留最有说服力的那一种:显式 > 相似 > 标签
+        rank = {"related": 0, "vector": 1, "tag": 2}
+
+        def add_link(a, b, kind, label):
+            if a == b or a not in ids or b not in ids:
+                return
+            key = (a, b) if a < b else (b, a)
+            old = links.get(key)
+            if old is None or rank[kind] < rank[old["kind"]]:
+                links[key] = {"kind": kind, "label": label}
+
+        # ① 显式关联:frontmatter 的 related
+        for bid, meta in keep.items():
+            for other in (meta.get("related") or []):
+                add_link(bid, str(other), "related", "存入时关联到一起")
+
+        # ② 向量相似
+        if embedding_engine and embedding_engine.enabled:
+            embeddings = {}
+            for bid in keep:
+                emb = await embedding_engine.get_embedding(bid)
+                if emb is not None:
+                    embeddings[bid] = emb
+            emb_ids = list(embeddings.keys())
+            per_node = {bid: [] for bid in emb_ids}
+            for i, id_a in enumerate(emb_ids):
+                for id_b in emb_ids[i + 1:]:
+                    sim = embedding_engine._cosine_similarity(embeddings[id_a], embeddings[id_b])
+                    if sim >= FLUX_VECTOR_MIN_SIM:
+                        per_node[id_a].append((sim, id_b))
+                        per_node[id_b].append((sim, id_a))
+            for bid, cands in per_node.items():
+                cands.sort(reverse=True)
+                for sim, other in cands[:FLUX_VECTOR_PER_NODE]:
+                    add_link(bid, other, "vector", "说的是相近的事(%.2f)" % sim)
+
+        # ③ 共享标签(太泛的标签不算关联)
+        by_tag = {}
+        for bid, meta in keep.items():
+            for t in (meta.get("tags") or []):
+                by_tag.setdefault(str(t), []).append(bid)
+        tag_count = {bid: 0 for bid in keep}
+        for tag, members in sorted(by_tag.items(), key=lambda kv: len(kv[1])):
+            if len(members) < 2 or len(members) > FLUX_TAG_MAX_FANOUT:
+                continue
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    if tag_count[a] >= FLUX_TAG_PER_NODE or tag_count[b] >= FLUX_TAG_PER_NODE:
+                        continue
+                    before = len(links)
+                    add_link(a, b, "tag", "都带「%s」" % tag)
+                    if len(links) > before:
+                        tag_count[a] += 1
+                        tag_count[b] += 1
+
+        out_links = [
+            {"a": k[0], "b": k[1], "kind": v["kind"], "label": v["label"]}
+            for k, v in list(links.items())[:FLUX_MAX_LINKS]
+        ]
+
+        nodes.sort(key=lambda x: x["created"])
+        return JSONResponse({
+            "count": len(nodes),
+            "nodes": nodes,
+            "links": out_links,
+            "truncated": len(links) > FLUX_MAX_LINKS,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

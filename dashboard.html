@@ -842,6 +842,9 @@
     .header .stats { font-size: 11px; max-width: 100%; white-space: normal; line-height: 1.5; }
     .header-actions { order: 2; }
     .icon-btn { height: 32px; padding: 0 12px; font-size: 12px; }
+    /* 手机上银河/乱流只留图标 —— 三个按钮都带字的话,标题下面那行统计会被挤到折行 */
+    .icon-btn span { display: none; }
+    .icon-btn[href="galaxy"], .icon-btn[href="flux"] { padding: 0 10px; }
     /* 搜索框独占一行 */
     .search-bar { order: 3; margin-left: 0; width: 100%; }
     .search-bar input { width: 100%; }
@@ -966,7 +969,10 @@
     <span class="stats" id="stats">loading...</span>
   </div>
   <div class="header-actions">
-    <a class="icon-btn" href="galaxy" title="记忆银河">🌌 <span>记忆银河</span></a>
+    <a class="icon-btn" href="galaxy" title="记忆银河:一条记忆一颗星,按时间铺开">🌌 <span>银河</span></a>
+    <a class="icon-btn" href="flux" title="记忆乱流:一条记忆一个字,点开看它牵着谁">
+      <svg class="ico" viewBox="0 0 16 16"><path d="M2.4 4.2c2.6 0 2.6 2 5.2 2s2.6-2 5.2-2"/><path d="M2.4 8c2.6 0 2.6 2 5.2 2s2.6-2 5.2-2"/><path d="M2.4 11.8c2.6 0 2.6 2 5.2 2"/></svg>
+      <span>乱流</span></a>
     <button class="icon-btn" onclick="doLogout()" title="退出登录">退出</button>
   </div>
   <div class="search-bar">
