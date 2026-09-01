@@ -4,18 +4,27 @@ Memory Flux page / 记忆乱流页面
 这一页是什么
 ------------------------------------------------------------------
 银河(/galaxy)讲的是**时间**:一条记忆一颗星,越早越靠银心。
-乱流(/flux)讲的是**关系**:一条记忆一个字,漂在字流里;静的时候它只是流,
+乱流(/flux)讲的是**关系**:一条记忆铺成好几个字符,漂在字流里;静的时候它只是流,
 点一个字才把它牵着的那些记忆拉出来。
 
 它顶掉的是 2026-08-31 砍掉的那个又丑又空的「记忆网络」——同一件事,
 换个好看的说法。数据走 /api/flux(三种关联:related / tag / vector)。
 
-字为什么是记忆的第一个字
+字为什么是字母和数字
 ------------------------------------------------------------------
-参考来源(fuyue 的字符星群)用的是随机拉丁字母,好看但认不出谁是谁。
-这里改成**取标题的第一个字**(没标题就取正文第一个字)——同样是一片字流,
-但每个字都是那条记忆自己的,扫一眼能认出「哦这是那条」。
-铺底的噪音字才是随机的,而且不可点、颜色压得很淡。
+和参考效果一样,全部用拉丁字母 / 数字 / 符号,不用汉字。
+我一开始自作主张改成「记忆标题的第一个字」,想着能认出是哪条 —— 但汉字笔画重、
+字宽也宽,几百个撒下去是一片黑压压的方块,不是流。栖栖对着原效果指出来了,
+改回字母数字。想知道是哪条,点它,卡片里有中文标题。
+
+每条记忆的「主字」由它的 id 定死(同一条记忆每次打开都是同一个字母),
+比投影字符略大略深,是这条记忆在流里的锚点。
+
+位置是真随机的
+------------------------------------------------------------------
+第一版用黄金角均匀铺,结果排出了肉眼可见的列和斜带 —— 太整齐,不像乱流。
+现在用一个按下标定死的伪随机数发生器(seeded PRNG):看着是乱的,但每次打开
+位置一样,不会每次刷新都跳。
 
 为什么这一页是 .py 而不是 .html
 ------------------------------------------------------------------
@@ -191,7 +200,7 @@ body{
 <script>
 /* ═══════════════════════════════════════════════════════════════
    记忆乱流
-   一条记忆一个字(取它标题的第一个字),漂在一层噪音字上面。
+   一条记忆铺成好几个字母/数字,漂在一层噪音字符里。
    点一个字 → 锁定它,把一跳/二跳的关联画出来。
    拖拽平移、双指捏合缩放、双击复位。
    ═══════════════════════════════════════════════════════════════ */
@@ -257,17 +266,29 @@ function layoutWorld(){
   worldH = H * 1.45;
 }
 
-// 每条记忆取一个字:标题第一个字,没标题就取正文第一个能看的字
-function glyphOf(item){
-  var s = (item.name || item.content || '').replace(/^[\s\n\r"'「『（(【\[]+/, '');
-  return s ? Array.from(s)[0] : '·';
+// 一个按种子定死的伪随机数发生器(mulberry32)。
+// 位置用它算 —— 看着乱,但每次打开都一样,刷新不会满屏跳。
+function rnd(seed){
+  var t = (seed + 0x6D2B79F5) | 0;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+function hashText(s){
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
 }
 
-// 黄金角散布:比纯随机匀,又不会排成格子
-function place(i, total){
-  var gx = (i * 0.6180339887 + 0.11) % 1;
-  var gy = (i + 0.5) / total;
-  return { x: gx, y: gy };
+// 每条记忆的主字:由 id 定死的一个字母/数字,同一条记忆永远是同一个。
+function glyphOf(item){
+  return GLYPHS[hashText(String(item.id)) % GLYPHS.length];
+}
+
+// 位置:真随机撒。
+// 第一版用黄金角均匀铺,排出了看得见的列和斜带,整整齐齐的一点也不「乱流」。
+function place(i){
+  return { x: rnd(i * 3 + 1), y: rnd(i * 3 + 2) };
 }
 
 function buildScene(data){
@@ -285,15 +306,17 @@ function buildScene(data){
   var k = 0;
   items.forEach(function(it, i){
     for (var j = 0; j < perMemory; j++){
-      var p = place(k, Math.max(1, total));
-      var seed = (i * 2654435761 + j * 40503) % 1000 / 1000;
+      var p = place(k);
       nodes.push({
         item: it,
         primary: j === 0,
-        glyph: j === 0 ? glyphOf(it) : GLYPHS[Math.floor(seed * GLYPHS.length)],
+        // 投影字符也由 (id, 第几个投影) 定死,不是每次刷新重掷
+        glyph: j === 0 ? glyphOf(it)
+                       : GLYPHS[hashText(it.id + ':' + j) % GLYPHS.length],
         x: p.x, y: p.y,
-        depth: 0.35 + seed * 0.65,
-        sway: ((k % 23) / 23) * Math.PI * 2,
+        depth: 0.32 + rnd(k * 7 + 3) * 0.68,      // 远近:大小、飘速都跟着它
+        speed: 0.6 + rnd(k * 7 + 5) * 1.1,        // 每个字自己的速度,不齐步走
+        sway: rnd(k * 7 + 9) * Math.PI * 2,
         color: domColor(it.domain)
       });
       k++;
@@ -308,6 +331,7 @@ function buildScene(data){
       ch: GLYPHS[Math.floor(Math.random() * GLYPHS.length)],
       x: Math.random(), y: Math.random(),
       depth: 0.3 + Math.random() * 0.7,
+      speed: 0.6 + Math.random() * 1.1,
       a: 0.10 + Math.random() * 0.18
     });
   }
@@ -320,6 +344,7 @@ function buildScene(data){
       x: Math.random(), y: Math.random(),
       len: 0.05 + Math.random() * 0.16,      // 归一化世界高度
       depth: 0.35 + Math.random() * 0.65,
+      speed: 0.6 + Math.random() * 1.4,
       sway: Math.random() * Math.PI * 2,
       a: 0.05 + Math.random() * 0.11
     });
@@ -344,7 +369,7 @@ function buildScene(data){
 
 // 记忆自己漂到哪儿了(归一化世界坐标)
 function naturalOf(n, now){
-  var drift = reduceMotion ? 0 : (now - startedAt) / 1000 * 0.012 * n.depth;
+  var drift = reduceMotion ? 0 : (now - startedAt) / 1000 * 0.012 * n.depth * (n.speed || 1);
   var sway = reduceMotion ? 0 : Math.sin((now - startedAt) / 2600 + n.sway) * 0.006;
   return { x: n.x + sway, y: ((n.y - drift) % 1 + 1) % 1 };
 }
@@ -468,11 +493,8 @@ function draw(){
     else if (near) alpha = n.primary ? 0.4 : 0.18;
     else alpha = n.primary ? 0.13 : 0.07;
 
-    if (n.primary){
-      ctx.font = (isSel ? 600 : 500) + ' ' + (isSel ? fs * 1.7 : fs) + 'px "Noto Serif SC", "Songti SC", Inter, serif';
-    } else {
-      ctx.font = fs + 'px Inter, "SF Mono", ui-monospace, monospace';
-    }
+    ctx.font = (n.primary ? (isSel ? 700 : 600) + ' ' : '') +
+      (isSel ? fs * 1.7 : fs) + 'px "SF Mono", ui-monospace, Menlo, Inter, monospace';
 
     // 没选中的时候整片是灰的 —— 域的颜色只在「被点到的那一簇」上出现。
     // 一上来就满屏彩色中文会花得像糖果,也就看不出哪儿才是重点了。
