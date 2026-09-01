@@ -220,7 +220,11 @@ var LINK_STYLE = {
 };
 
 // 铺底的噪音字。它们不是记忆,不可点,只负责让画面像一片流动的字。
-var NOISE = '一丨丿丶乀㇀㇁㇂丷冫氵讠亻⺀·˙‥…｜╱╲～≈∿⌇⟡◦';
+// 投影字符集:和参考效果一样,拉丁字母 + 数字 + 符号。
+// 每条记忆除了一个「主字」(它标题的第一个字),还会铺出好几个这样的投影字符 ——
+// 密度是这一屏的命根子:一条记忆只画一个字的话,几百条撒在屏幕上就是一片空白,
+// 根本不像「流」。
+var GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%*()[]{}';
 
 var canvas = document.getElementById('cv');
 var ctx = canvas.getContext('2d');
@@ -245,12 +249,12 @@ function resize(){
 }
 window.addEventListener('resize', function(){ resize(); layoutWorld(); });
 
-// 世界比屏幕大 —— 记忆越多铺得越开,拖着能走出去
+// 世界只比屏幕大一点点。
+// 之前按记忆条数放大世界,结果 250 条记忆摊在三四屏里,一屏就剩几十个字 = 一片空白。
+// 密度该靠字的数量堆出来,不是靠把它们摊开。
 function layoutWorld(){
-  var n = Math.max(24, nodes.length);
-  var spread = Math.sqrt(n / 60);
-  worldW = W * Math.max(1.15, spread * 1.25);
-  worldH = H * Math.max(1.5, spread * 1.9);
+  worldW = W * 1.25;
+  worldH = H * 1.45;
 }
 
 // 每条记忆取一个字:标题第一个字,没标题就取正文第一个能看的字
@@ -268,33 +272,49 @@ function place(i, total){
 
 function buildScene(data){
   var items = data.nodes || [];
-  nodes = items.map(function(it, i){
-    var p = place(i, Math.max(1, items.length));
-    return {
-      item: it,
-      glyph: glyphOf(it),
-      x: p.x, y: p.y,
-      depth: 0.45 + ((i * 2654435761 % 1000) / 1000) * 0.55,  // 远近:影响大小和飘的速度
-      sway: (i % 17) / 17 * Math.PI * 2,
-      color: domColor(it.domain)
-    };
+  var coarse = window.matchMedia('(pointer: coarse)').matches;
+
+  // 总共要铺多少个字。手机上少一点,免得每帧画一千多个字把电烧了。
+  var target = coarse ? 900 : 1300;
+  var perMemory = Math.max(1, Math.min(8, Math.round(target / Math.max(1, items.length))));
+
+  // 每条记忆 = 一个主字(它标题的第一个字,有颜色、能点) + 若干投影字符(灰的,也能点,
+  // 点到哪个都算点到同一条记忆)。投影就是参考效果里那些满屏的字母数字。
+  nodes = [];
+  var total = items.length * perMemory;
+  var k = 0;
+  items.forEach(function(it, i){
+    for (var j = 0; j < perMemory; j++){
+      var p = place(k, Math.max(1, total));
+      var seed = (i * 2654435761 + j * 40503) % 1000 / 1000;
+      nodes.push({
+        item: it,
+        primary: j === 0,
+        glyph: j === 0 ? glyphOf(it) : GLYPHS[Math.floor(seed * GLYPHS.length)],
+        x: p.x, y: p.y,
+        depth: 0.35 + seed * 0.65,
+        sway: ((k % 23) / 23) * Math.PI * 2,
+        color: domColor(it.domain)
+      });
+      k++;
+    }
   });
 
-  // 噪音字:数量跟着记忆走,但有上限,手机上别烧电
-  var noiseCount = Math.min(560, Math.max(300, nodes.length * 3));
+  // 再撒一层纯噪音字符:它们不是记忆,不可点,只负责把画面填满
+  var noiseCount = coarse ? 260 : 380;
   noise = [];
-  for (var i = 0; i < noiseCount; i++){
+  for (var n = 0; n < noiseCount; n++){
     noise.push({
-      ch: NOISE[Math.floor(Math.random() * NOISE.length)],
+      ch: GLYPHS[Math.floor(Math.random() * GLYPHS.length)],
       x: Math.random(), y: Math.random(),
       depth: 0.3 + Math.random() * 0.7,
-      a: 0.13 + Math.random() * 0.22
+      a: 0.10 + Math.random() * 0.18
     });
   }
 
   // 光迹:向上流的细线。没有这一层,画面只是一把字撒在那儿,不像「流」。
   traces = [];
-  var traceCount = window.matchMedia('(pointer: coarse)').matches ? 46 : 72;
+  var traceCount = window.matchMedia('(pointer: coarse)').matches ? 90 : 130;
   for (var t = 0; t < traceCount; t++){
     traces.push({
       x: Math.random(), y: Math.random(),
@@ -308,7 +328,7 @@ function buildScene(data){
   links = data.links || [];
   adj = {};
   var byId = {};
-  nodes.forEach(function(n, i){ byId[n.item.id] = i; });
+  nodes.forEach(function(n, i){ if (n.primary) byId[n.item.id] = i; });   // 线连主字
   links.forEach(function(l){
     l.ia = byId[l.a]; l.ib = byId[l.b];
     if (l.ia === undefined || l.ib === undefined) return;
@@ -319,7 +339,7 @@ function buildScene(data){
 
   layoutWorld();
   document.getElementById('zh').textContent =
-    '记忆乱流 · ' + nodes.length + ' 条记忆 · ' + links.length + ' 条关联';
+    '记忆乱流 · ' + items.length + ' 条记忆 · ' + links.length + ' 条关联';
 }
 
 // 记忆自己漂到哪儿了(归一化世界坐标)
@@ -349,10 +369,11 @@ function screenOf(n, now){
 }
 
 function fontSize(n){
+  if (!n.primary) return (7 + n.depth * 6) * scale;   // 投影字符:小、退到后面去
   var imp = n.item.importance == null ? 5 : n.item.importance;
-  var base = 11 + imp * 0.85;                 // 10 分的比 2 分的明显大一圈
+  var base = 9 + imp * 0.55;                          // 主字:重要度越高越大
   if (n.item.pinned) base += 2;
-  return base * (0.72 + n.depth * 0.42) * scale;
+  return base * (0.8 + n.depth * 0.3) * scale;
 }
 
 function draw(){
@@ -389,7 +410,7 @@ function draw(){
     var m = noise[i];
     var p = screenOf(m, now);
     if (p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40) continue;
-    ctx.font = (9 + m.depth * 9) * scale + 'px "Noto Serif SC", "Songti SC", Inter, serif';
+    ctx.font = (7 + m.depth * 6) * scale + 'px Inter, "SF Mono", ui-monospace, monospace';
     ctx.fillStyle = 'rgba(90,125,190,' + (m.a * dim) + ')';
     ctx.fillText(m.ch, p.x, p.y);
   }
@@ -436,31 +457,40 @@ function draw(){
     var n = nodes[j], p = pos[j];
     if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) continue;
     var fs = fontSize(n);
-    var isSel = selected && selected.item.id === n.item.id;
-    var lit = isSel || (selected && hop1[n.item.id]);
+    var sameMem = selected && selected.item.id === n.item.id;
+    var isSel = sameMem && n.primary;          // 只有主字放大发光,它的投影跟着亮
+    var lit = sameMem || (selected && hop1[n.item.id]);
     var near = selected && hop2[n.item.id];
     var alpha;
-    if (!selected) alpha = 0.34 + n.depth * 0.42;
+    if (!selected) alpha = n.primary ? (0.30 + n.depth * 0.26) : (0.14 + n.depth * 0.18);
     else if (isSel) alpha = 1;
-    else if (lit) alpha = 0.9;
-    else if (near) alpha = 0.4;
-    else alpha = 0.16;
+    else if (lit) alpha = n.primary ? 0.92 : 0.5;
+    else if (near) alpha = n.primary ? 0.4 : 0.18;
+    else alpha = n.primary ? 0.13 : 0.07;
 
-    ctx.font = (isSel ? 600 : 500) + ' ' + (isSel ? fs * 1.75 : fs) + 'px "Noto Serif SC", "Songti SC", Inter, serif';
+    if (n.primary){
+      ctx.font = (isSel ? 600 : 500) + ' ' + (isSel ? fs * 1.7 : fs) + 'px "Noto Serif SC", "Songti SC", Inter, serif';
+    } else {
+      ctx.font = fs + 'px Inter, "SF Mono", ui-monospace, monospace';
+    }
+
+    // 没选中的时候整片是灰的 —— 域的颜色只在「被点到的那一簇」上出现。
+    // 一上来就满屏彩色中文会花得像糖果,也就看不出哪儿才是重点了。
+    var col = (selected && (sameMem || hop1[n.item.id])) ? n.color : '#5A78AF';
     if (isSel){
       ctx.save();
       // 身后垫一团淡光,免得被围过来的那一圈字盖住
       var halo = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, fs * 1.9);
-      halo.addColorStop(0, hexA(n.color, .18));
-      halo.addColorStop(1, hexA(n.color, 0));
+      halo.addColorStop(0, hexA(col, .2));
+      halo.addColorStop(1, hexA(col, 0));
       ctx.fillStyle = halo;
       ctx.beginPath(); ctx.arc(p.x, p.y, fs * 1.9, 0, Math.PI * 2); ctx.fill();
-      ctx.shadowColor = hexA(n.color, .5); ctx.shadowBlur = 16 * Math.min(2, scale);
-      ctx.fillStyle = hexA(n.color, 1);
+      ctx.shadowColor = hexA(col, .5); ctx.shadowBlur = 16 * Math.min(2, scale);
+      ctx.fillStyle = hexA(col, 1);
       ctx.fillText(n.glyph, p.x, p.y);
       ctx.restore();
     } else {
-      ctx.fillStyle = hexA(n.color, alpha);
+      ctx.fillStyle = hexA(col, alpha);
       ctx.fillText(n.glyph, p.x, p.y);
     }
   }
@@ -470,12 +500,22 @@ function draw(){
 
 // ── 点中哪个字 ──
 function pick(sx, sy){
-  var now = performance.now(), best = null, bestD = 1e9;
+  var now = performance.now(), best = null, bestScore = 1e9;
   for (var i = 0; i < nodes.length; i++){
-    var p = screenOf(nodes[i], now);
+    var n = nodes[i];
+    var p = screenOf(n, now);
     var d = Math.hypot(p.x - sx, p.y - sy);
-    var r = Math.max(18, fontSize(nodes[i]) * 0.9);
-    if (d < r && d < bestD){ bestD = d; best = nodes[i]; }
+    var r = n.primary ? Math.max(20, fontSize(n) * 1.0) : Math.max(11, fontSize(n) * 0.85);
+    if (d > r) continue;
+    // 主字优先:它更大、更好认,手指落在两者之间时该选它
+    var score = d - (n.primary ? 14 : 0);
+    if (score < bestScore){ bestScore = score; best = n; }
+  }
+  if (!best) return null;
+  if (best.primary) return best;
+  // 点到的是投影 —— 换成那条记忆的主字,后面的吸附和高亮都以主字为准
+  for (var j = 0; j < nodes.length; j++){
+    if (nodes[j].primary && nodes[j].item.id === best.item.id) return nodes[j];
   }
   return best;
 }
@@ -509,7 +549,7 @@ function select(n){
   // 再换算回世界坐标 —— 这样不管缩放到多少、记忆库多大,圈看上去都一样大。
   var ring = Object.keys(hop1);
   var byId = {};
-  nodes.forEach(function(x){ byId[x.item.id] = x; });
+  nodes.forEach(function(x){ if (x.primary) byId[x.item.id] = x; });   // 只吸主字
   var radiusPx = Math.min(W, H) * (ring.length > 8 ? 0.30 : 0.24);
   var rx = radiusPx / Math.max(1, worldW * scale);
   var ry = radiusPx / Math.max(1, worldH * scale);
