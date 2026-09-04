@@ -60,6 +60,7 @@ from maintenance import backfill_mood, backfill_related
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from backup_engine import BackupEngine
+from authwatch_engine import AuthWatchEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
 from datetime import timedelta, datetime, date
 
@@ -181,6 +182,7 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 backup_engine = BackupEngine(config, bucket_mgr)     # Daily backup engine / 每日备份引擎
+authwatch_engine = AuthWatchEngine()                  # 订阅健康看门狗(未配环境变量则完全不启动)
 digest_engine = DigestEngine(config, bucket_mgr, embedding_engine, dehydrator)  # Auto-digest / 自动消化引擎
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
@@ -485,6 +487,13 @@ async def health_check(request):
         await digest_engine.ensure_started()
     except Exception as e:
         logger.warning(f"Digest scanner start failed / 消化扫描启动失败: {e}")
+    # 订阅健康看门狗:盯上游 OAuth 续签 + 订阅额度。同样懒启动。
+    # 它只读中转代理的管理接口 + 发 Telegram,不碰模型、不碰记忆、不写任何凭据;
+    # 没配 AUTHWATCH_* 环境变量时 start() 直接返回,等于这个模块不存在。
+    try:
+        await authwatch_engine.ensure_started()
+    except Exception as e:
+        logger.warning(f"AuthWatch start failed / 订阅健康看门狗启动失败: {e}")
     # 存量维护:补情绪坐标 + 补关联，一辈子只跑一次（见 _run_startup_maintenance）。
     # 放后台跑，不拖慢 /health —— 保活循环每 60 秒 ping 一次，超时会被当成服务挂了。
     if STARTUP_MAINTENANCE and not _maintenance_done:
@@ -496,6 +505,7 @@ async def health_check(request):
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
             "backup_scheduler": "running" if backup_engine.is_running else "stopped",
+            "authwatch": "running" if authwatch_engine.is_running else "stopped",
         }
         # 只报数字，不报任何记忆内容：这是公开端点
         mstate = _load_maintenance_state()
