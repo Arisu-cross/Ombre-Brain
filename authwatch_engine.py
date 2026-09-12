@@ -1,9 +1,32 @@
 """
 Subscription health watchdog / 订阅健康看门狗。
 
-盯两件事,**都不消耗任何模型 token**(只读 CPA 管理接口 + 发 Telegram):
-  ① 上游订阅 OAuth 的续签是不是停了
-  ② 订阅额度是不是快烧干了
+盯三件事,**都不消耗任何模型 token**(只读 CPA 管理接口 + 算日期 + 发 Telegram):
+  ① 上游订阅 OAuth 的续签是不是停了        —— 只在还走 CPA 时有意义
+  ② 订阅额度是不是快烧干了                  —— 同上
+  ③ **直连用的长期令牌是不是快到期了**      —— 2026-09-12 新增
+
+2026-09-12:沈渡改成直连,CPA 已不在链路上(改这个文件前先读这段)
+─────────────────────────────────────────────
+  沈渡现在用 `claude setup-token` 生成的**一年期长期令牌**直连 Anthropic,
+  不再经 CPA。CPA 服务没删、原地留作退路(shim 删掉 CLAUDE_CODE_OAUTH_TOKEN
+  + 重启即可退回)。
+
+  **这对本模块有两个后果,都必须处理:**
+
+  1. **①② 那两项检查对现在的沈渡不再成立。** 更麻烦的是:没有流量经过 CPA 了,
+     它的凭据**从此不会再被刷新** → 「mtime 停止更新」这个主信号会**永远成立**,
+     于是每 2 小时给栖栖推一条假警报。**所以 CPA 那组检查必须能单独关掉**
+     —— 不配 AUTHWATCH_MGMT_KEY 即整组不跑(见 cpa_enabled)。
+
+  2. **新的失效方式是「到期」,不是「刷新停了」。** 长期令牌一年整,期间没有任何
+     续签动作可观察,**到期前一秒都完全正常** —— 没有任何运行时信号可看。
+     唯一能提前发出的信号是**日期**。所以做法是:把到期日写进环境变量
+     AUTHWATCH_TOKEN_EXPIRES,到期前 30 / 7 / 3 / 1 天各提醒一次。
+
+  ⚠️ **本模块不持有那把令牌,也不该持有。** 它只需要知道「哪天到期」这个日期。
+     令牌正本只在 Zeabur 的 kelivo-shim 环境变量里。别为了「顺便校验一下」
+     把令牌复制到 OB 来 —— 多一处存放就多一处泄露面,而且校验它还得真发请求。
 
 为什么这个东西要长在 OB 里(2026-09-04 决定,别搬回去)
 ─────────────────────────────────────────────
@@ -36,13 +59,24 @@ Subscription health watchdog / 订阅健康看门狗。
 
 环境变量 / Environment variables
 ─────────────────────────────────────────────
-  AUTHWATCH_MGMT_KEY        代理的管理密码(**必填,不填则整个功能关闭**)
-  AUTHWATCH_TG_TOKEN        Telegram bot token(必填,否则只记日志发不出去)
+  AUTHWATCH_TG_TOKEN        Telegram bot token(必填,否则整个模块不启动)
   AUTHWATCH_TG_CHAT         Telegram chat id(必填)
+
+  —— 下面两组各自独立开关,**至少配一组**本模块才会启动 ——
+
+  [CPA 组] 只在沈渡还走中转时才该配。2026-09-12 起已直连,**这组应当留空**。
+  AUTHWATCH_MGMT_KEY        代理的管理密码(不填 = CPA 那组检查整组不跑)
   AUTHWATCH_CPA_URL         代理地址(默认 https://kelivo-cpa-7351.zeabur.app)
-  AUTHWATCH_INTERVAL_MIN    检查间隔分钟(默认 30)
-  AUTHWATCH_STALE_HOURS     多久没刷新算续签停了(默认 4.5 = 实测 4 小时周期 + 30 分容错)
+  AUTHWATCH_STALE_HOURS     多久没刷新算续签停了(默认 4.5)
   AUTHWATCH_QUOTA_WARN      额度用到多少算告急(默认 0.85)
+
+  [长期令牌组] 直连模式下配这个。
+  AUTHWATCH_TOKEN_EXPIRES   令牌到期日,ISO 日期或时刻(如 2027-09-12)。
+                            不填 = 这项不跑。**日期是手填的,换令牌时记得同步改**。
+  AUTHWATCH_TOKEN_WARN_DAYS 提前多少天开始提醒,逗号分隔(默认 30,7,3,1)
+
+  [公共]
+  AUTHWATCH_INTERVAL_MIN    检查间隔分钟(默认 30)
   AUTHWATCH_REALERT_HOURS   同一个问题隔多久再提醒一次(默认 2)
 """
 
@@ -94,6 +128,27 @@ def _num(name: str, default: float, lo: float, hi: float) -> float:
     return v
 
 
+def _days(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """取「提前几天提醒」的列表。写错一律退回默认 ——
+    配置写错不该让到期提醒整个哑掉,那正是我们要防的事。"""
+    raw = _env(name)
+    if not raw:
+        return default
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            logger.warning(f"{name}={raw!r} 里有非整数,整项退回默认 {default}")
+            return default
+        if 0 <= v <= 365:
+            out.append(v)
+    return tuple(sorted(set(out), reverse=True)) or default
+
+
 class AuthWatchEngine:
     """订阅健康看门狗。用法与 BackupEngine / DigestEngine 一致。"""
 
@@ -107,6 +162,8 @@ class AuthWatchEngine:
         self.stale_hours = _num("AUTHWATCH_STALE_HOURS", 4.5, 1, 24)
         self.quota_warn = _num("AUTHWATCH_QUOTA_WARN", 0.85, 0.1, 1.0)
         self.realert_hours = _num("AUTHWATCH_REALERT_HOURS", 2, 0.5, 24)
+        self.token_expires = _env("AUTHWATCH_TOKEN_EXPIRES")
+        self.token_warn_days = _days("AUTHWATCH_TOKEN_WARN_DAYS", (30, 7, 3, 1))
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -119,9 +176,26 @@ class AuthWatchEngine:
         return self._running
 
     @property
+    def cpa_enabled(self) -> bool:
+        """CPA 那组检查跑不跑。**2026-09-12 起沈渡直连,这里应当是 False。**
+
+        为什么必须能单独关:没有流量经过 CPA 之后,它的凭据再也不会被刷新,
+        「mtime 停止更新」这个主信号会永远成立 → 每 2 小时一条假警报。
+        假警报比没警报更糟:几次之后人就不看了,真出事那条也一起被忽略。
+        """
+        return bool(self.mgmt_key)
+
+    @property
+    def token_enabled(self) -> bool:
+        """长期令牌到期提醒跑不跑。"""
+        return bool(self.token_expires)
+
+    @property
     def configured(self) -> bool:
-        """三样齐全才算配好。缺任何一样都不启动 —— 未配置时本模块等于不存在。"""
-        return bool(self.mgmt_key and self.tg_token and self.tg_chat)
+        """TG 两样必须有,外加**至少一组**检查被打开。
+        两组都空 = 本模块等于不存在(这是「合进来等于没合」的保证)。"""
+        return bool(self.tg_token and self.tg_chat
+                    and (self.cpa_enabled or self.token_enabled))
 
     # ---------------------------------------------------------
     # 判定逻辑(纯函数,便于单测)
@@ -221,9 +295,63 @@ class AuthWatchEngine:
         return problems, lines
 
     # ---------------------------------------------------------
+    # 长期令牌到期(纯算日期,不发任何请求、不碰令牌本身)
+    # ---------------------------------------------------------
+    @staticmethod
+    def _parse_expiry(raw: str) -> datetime | None:
+        """接受 2027-09-12 或 2027-09-12T03:00:00Z 这类写法。
+        只写日期时当成那天的 00:00 UTC —— 宁可早报一点,不可晚报。"""
+        s = str(raw).strip().replace("Z", "+00:00")
+        try:
+            t = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t
+
+    def check_token_expiry(self, now: datetime | None = None) -> tuple[list[str], list[str]]:
+        """返回 (problems, 展示行)。now 可注入,便于单测。"""
+        if not self.token_enabled:
+            return [], []
+        exp = self._parse_expiry(self.token_expires)
+        if exp is None:
+            # 日期写错了 = 到期提醒其实没在保护你。这本身就该报出来,别静默。
+            return ([f"AUTHWATCH_TOKEN_EXPIRES 写的不是日期({self.token_expires!r}),"
+                     "到期提醒现在是**没在工作**的状态 —— 这条一直报到改对为止。"], [])
+
+        now = now or datetime.now(timezone.utc)
+        left_days = (exp - now).total_seconds() / 86400.0
+        shown = (exp + timedelta(hours=8)).strftime("%Y-%m-%d")
+        lines = [f"· 直连令牌到期:{shown}(北京时间),还有 {left_days:.1f} 天"]
+
+        how = ("换法:找一个 CC 会话,按手册 §10「2026-09-12」条目走一次 "
+               "`claude setup-token` —— 它给你一条链接,你在手机上点开授权、"
+               "把页面显示的那串码发回去就完事,大概五分钟。"
+               "换完记得把新的到期日填进 OB 的 AUTHWATCH_TOKEN_EXPIRES。")
+
+        if left_days <= 0:
+            return ([f"**直连令牌已经过期了**({shown})。沈渡现在多半已经说不出话。"
+                     f"{how} 应急退路:把 kelivo-shim 的 CLAUDE_CODE_OAUTH_TOKEN 删掉 + 重启,"
+                     "退回中转那条路(但那边的授权大概也已经放坏了)。"], lines)
+
+        # 只在跨过某一档时报,不是每轮都报 —— 去重交给 _maybe_alert,
+        # 但档位本身要让问题文本不同,否则 30 天那条会一直压着后面几档。
+        for d in self.token_warn_days:
+            if left_days <= d:
+                return ([f"直连令牌还有 {left_days:.0f} 天到期({shown})。{how}"], lines)
+        return [], lines
+
+    # ---------------------------------------------------------
     # 一次检查
     # ---------------------------------------------------------
     async def check_once(self) -> tuple[list[str], list[str]]:
+        problems, lines = self.check_token_expiry()
+        if not self.cpa_enabled:
+            # 直连模式:CPA 已不在链路上,那组检查不跑(跑了全是假警报,见类文档)
+            return problems, lines
+        p, l = await self._check_cpa()
+        return problems + p, lines + l
+
+    async def _check_cpa(self) -> tuple[list[str], list[str]]:
         url = f"{self.cpa_url}/v0/management/auth-files"
         headers = {"Authorization": f"Bearer {self.mgmt_key}"}
         last_err = None
@@ -288,13 +416,18 @@ class AuthWatchEngine:
         if not (fresh or stale):
             return
 
+        # 尾巴只在还走 CPA 时才附那套重新授权的步骤;直连模式下怎么办已经写在
+        # check_token_expiry 的问题文本里了,别再贴一套过时的 localhost 流程误导人。
+        tail = ""
+        if self.cpa_enabled:
+            tail = ("\n\n授权断了的话:让 CC 会话按手册 2026-09-02 条目重新走一次 "
+                    "Anthropic OAuth。三步 —— 取授权链接 → 你去授权(浏览器会白屏,"
+                    "这是正常的)→ 把地址栏那条 localhost 网址整条抄回来提交。"
+                    "做完要重启中转代理清冷却。")
         msg = ("⚠️ 沈渡系统 · 有事要处理\n\n"
                + "\n".join(f"· {p}" for p in problems)
                + "\n\n当前状态:\n" + "\n".join(lines)
-               + "\n\n授权断了的话:让 CC 会话按手册 2026-09-02 条目重新走一次 "
-                 "Anthropic OAuth。三步 —— 取授权链接 → 你去授权(浏览器会白屏,"
-                 "这是正常的)→ 把地址栏那条 localhost 网址整条抄回来提交。"
-                 "做完要重启中转代理清冷却。")
+               + tail)
         if await self._send(msg):
             self._last_key = key
             self._last_alert_at = now
@@ -311,13 +444,20 @@ class AuthWatchEngine:
             return
         if not self.configured:
             # 没配就不启动。这是「合进来等于没合」的保证,别改成警告后照样跑。
-            logger.info("订阅健康看门狗未配置(缺 AUTHWATCH_MGMT_KEY / TG),不启动")
+            logger.info("订阅健康看门狗未配置(缺 TG,或 CPA / 长期令牌两组都没配),不启动")
             return
         self._running = True
         self._task = asyncio.create_task(self._background_loop())
+        watches = []
+        if self.cpa_enabled:
+            watches.append(f"CPA(续签阈值 {self.stale_hours}h / 额度告急线 "
+                           f"{self.quota_warn * 100:.0f}%)")
+        if self.token_enabled:
+            watches.append(f"长期令牌到期({self.token_expires},提前 "
+                           f"{'/'.join(str(d) for d in self.token_warn_days)} 天提醒)")
         logger.info(
-            f"订阅健康看门狗已启动:每 {self.interval_min:.0f} 分钟一次,"
-            f"续签阈值 {self.stale_hours} 小时 / 额度告急线 {self.quota_warn * 100:.0f}%"
+            f"订阅健康看门狗已启动:每 {self.interval_min:.0f} 分钟一次;"
+            f"在盯 —— {';'.join(watches)}"
         )
 
     async def stop(self) -> None:
