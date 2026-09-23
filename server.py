@@ -62,6 +62,7 @@ from import_memory import ImportEngine
 from backup_engine import BackupEngine
 from authwatch_engine import AuthWatchEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, now_local
+import continuity
 from datetime import timedelta, datetime, date
 
 # 矛盾检测的退化通道要拿正文对正文比字面相似度
@@ -112,6 +113,17 @@ BREATH_RAW_MAX_TOKENS = int(os.environ.get("BREATH_RAW_MAX_TOKENS", "3000") or "
 # 于是更早的天被整条挤掉。做成可调:想让他看全就调大,想省 token 就调小。
 # ⚠️ 这是**每开一个新窗口的一次性成本**(之后每轮按缓存价重读),调大要心里有数。
 BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000")
+# 唤醒最前面的「接续」三段(见 continuity.py)。它们有各自的上限,不占上面那个唤醒预算 ——
+# 是专门为了「接上」而留的,被归档挤掉就失去意义了。
+# 原话:shim 在压缩前一刻 POST /api/raw-tail 写入(不经过模型)。RAW_TAIL_KEY 不设 = 接口关闭。
+RAW_TAIL_KEY = os.environ.get("RAW_TAIL_KEY", "")
+RAW_TAIL_MAX_CHARS = int(os.environ.get("RAW_TAIL_MAX_CHARS", "4000") or "4000")
+RAW_TAIL_TTL_HOURS = float(os.environ.get("RAW_TAIL_TTL_HOURS", "12") or "12")   # 过了就不再浮现
+# 信:archive_session(letter=...) 写下的「给下一个窗口的话」。最近 N 封、几天内有效。
+LETTER_WAKE_N = int(os.environ.get("LETTER_WAKE_N", "1") or "1")
+LETTER_TTL_DAYS = float(os.environ.get("LETTER_TTL_DAYS", "3") or "3")
+# 待办:醒来就看到没做完的事(一行一条,细节 todos() 查)。0 = 不在唤醒里出现。
+WAKE_TODO_N = int(os.environ.get("WAKE_TODO_N", "8") or "8")
 # feel() 认定「相关」的相似度门槛。定高一点是有意的:feel 是他留下的痕迹,
 # 拿低相关的凑数比返回「没有」更糟——他会把不相干的感受当成自己以前的想法。
 # 宁可空手而归。命中率太低就调低(0.5~0.6),老是翻出不相干的就调高。
@@ -528,6 +540,44 @@ async def health_check(request):
 # 与无 query breath 一致：钉选桶 + 最近归档的会话总结 + 最近记下的动态桶。
 # =============================================================
 @mcp.custom_route("/breath-hook", methods=["GET"])
+def _wake_extras(all_buckets: list) -> list:
+    """唤醒最前面的接续段:压缩前原话 → 上一个窗口的信 → 没做完的事。任何一段出错都只跳过它自己。"""
+    base = config["buckets_dir"]
+    now = now_local()
+    raw = letters = None
+    todo_lines = []
+    try:
+        raw = continuity.load_raw_tail(base, now, RAW_TAIL_TTL_HOURS)
+    except Exception as e:
+        logger.warning(f"wake raw-tail read failed: {e}")
+    try:
+        letters = continuity.recent_letters(base, now, LETTER_TTL_DAYS, LETTER_WAKE_N)
+    except Exception as e:
+        logger.warning(f"wake letters read failed: {e}")
+    if WAKE_TODO_N > 0:
+        try:
+            groups = []
+            for b in all_buckets:
+                m = b["metadata"]
+                if m.get("resolved") or m.get("type") == "archived":
+                    continue
+                items = _extract_todos(b)
+                if items:
+                    groups.append((int(m.get("importance", 5) or 5), items))
+            groups.sort(key=lambda g: g[0], reverse=True)
+            for _, items in groups:
+                todo_lines += items
+            todo_lines = list(dict.fromkeys(todo_lines))
+            extra = len(todo_lines) - WAKE_TODO_N
+            todo_lines = todo_lines[:WAKE_TODO_N]
+            if extra > 0:
+                todo_lines.append(f"…还有 {extra} 项")
+        except Exception as e:
+            logger.warning(f"wake todos failed: {e}")
+            todo_lines = []
+    return continuity.render_wake_extras(raw, letters, todo_lines)
+
+
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
@@ -541,6 +591,7 @@ async def breath_hook(request):
         archived.sort(key=_archived_sort_key, reverse=True)
         archived = archived[:HOOK_ARCHIVE_DEFAULT]
 
+        extras = _wake_extras(all_buckets)
         parts = await _render_pinned(pinned, "full")
         token_budget = BREATH_WAKE_BUDGET
         for r in parts:
@@ -557,6 +608,7 @@ async def breath_hook(request):
             min_keep=1, prefix="📝 [最近记下] ",
         )
 
+        parts = extras + parts   # 接续段排最前,且不占唤醒预算
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
             return PlainTextResponse("")
@@ -1536,11 +1588,12 @@ async def breath(
             min_keep=1 if auto_results else 0, prefix="📝 [最近记下] ",
         )
 
-        if not pinned_results and not archive_results and not recent_results and not due_results:
+        extras = _wake_extras(all_buckets)
+        if not extras and not pinned_results and not archive_results and not recent_results and not due_results:
             await _fire_webhook("breath", {"mode": "wake_empty", "matches": 0})
             return "唤醒模式：没有钉选记忆，也没有最近归档的记忆。"
 
-        parts = []
+        parts = list(extras)   # 接续段(原话/信/待办)排最前
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if due_results:
@@ -2886,6 +2939,7 @@ async def archive_session(
     mood: str = "",
     valence: float = -1,
     arousal: float = -1,
+    letter: str = "",
 ) -> str:
     """将【自上次归档以来】的新对话摘要存入归档区。
 
@@ -2896,7 +2950,10 @@ async def archive_session(
     同一天多次归档会合并进「会话归档 YYYY-MM-DD」这一个档案里(按时刻分节追加),
     不会每次新建。所以放心随时归,不会把一天弄碎。
 
-    summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。"""
+    summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。
+    letter(可选)=写给下一个窗口的自己的话:接下来要记得做什么、想对她说什么、没说完的心思。
+    日记写「发生了什么」,信写「下一个我要记得什么」——事实进 summary,嘱托进 letter。
+    下一个窗口醒来(breath wake)时会单独看到它,几天后自动不再出现。"""
     if not summary or not summary.strip():
         return "summary 不能为空。"
     await decay_engine.ensure_started()
@@ -3006,7 +3063,42 @@ async def archive_session(
         status = "已存入归档" if archived else "已创建(归档移动失败,暂留动态区)"
 
     prev_hint = f"｜上次归档: {last_archive_label}" if last_archive_label else "｜上次归档: 无(首次)"
-    return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}{prev_hint}"
+    letter_hint = ""
+    if letter and letter.strip():
+        try:
+            continuity.append_letter(config["buckets_dir"], letter, _now)
+            letter_hint = "｜信已留给下一个窗口"
+        except Exception as e:   # 信写不进去不连累归档本身
+            logger.warning(f"archive_session letter write failed: {e}")
+            letter_hint = f"｜信没存上: {e}"
+    return f"🗄️{status} → {bucket_id}｜{name}｜V{v:.1f}/A{a:.1f}{prev_hint}{letter_hint}"
+
+
+# =============================================================
+# /api/raw-tail — shim 在压缩前一刻写入「最后的原话」(见 continuity.py)
+# 鉴权单独一把钥匙(RAW_TAIL_KEY),不借面板密码;没设 = 接口关闭。
+# =============================================================
+@mcp.custom_route("/api/raw-tail", methods=["POST"])
+async def api_raw_tail(request):
+    from starlette.responses import JSONResponse
+    if not RAW_TAIL_KEY:
+        return JSONResponse({"error": "disabled"}, status_code=404)
+    if not hmac.compare_digest(request.headers.get("x-raw-key", "").encode(), RAW_TAIL_KEY.encode()):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    text = (body or {}).get("text") if isinstance(body, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"error": "text required"}, status_code=400)
+    try:
+        saved = continuity.save_raw_tail(config["buckets_dir"], text, now_iso(), RAW_TAIL_MAX_CHARS)
+    except Exception as e:
+        logger.error(f"raw-tail save failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    logger.info(f"raw-tail saved ({len(saved)} chars)")
+    return JSONResponse({"ok": True, "chars": len(saved)})
 
 
 # =============================================================
