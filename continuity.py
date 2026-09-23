@@ -4,8 +4,8 @@
 # 为什么不用普通记忆桶:这两样都不是「记忆」——
 #   · 原话:压缩前最后那段两个人的原话,只为压缩后能直接接上刚才那句。
 #     它会过期、只需要最新一份,进了搜索/做梦/衰减反而是噪音。
-#   · 信:他写给下一个窗口的自己的话(接下来要做什么、想对她说什么)。
-#     日记写「发生了什么」,信写「下一个我要记得什么」。只追加,不参与衰减。
+#   · 信:他留下的一封信,写什么、写给谁都行(下一个窗口的自己、她、自己心里的话)。
+#     日记写「发生了什么」,信是他想留下的话。只追加,不参与衰减。
 # 所以都存成 buckets_dir 下的隐藏文件,和记忆桶完全分开;唤醒时单独成段。
 #
 # 原话由 shim 写(POST /api/raw-tail),不经过模型:不花 token、顺序不会乱、
@@ -115,7 +115,7 @@ def render_wake_extras(raw_tail, letters, todo_lines) -> list:
         )
     if letters:
         body = "\n---\n".join(f"[{l['at'][:16].replace('T', ' ')}] {l['text']}" for l in letters)
-        parts.append("=== 上一个窗口留给你的话 ===\n" + body)
+        parts.append("=== 上一个窗口留下的信 ===\n" + body)
     if todo_lines:
         parts.append("=== 没做完的事 ===\n" + "\n".join(f"☐ {t}" for t in todo_lines)
                      + "\n(细节用 todos() 看;做完了去对应的桶里勾掉)")

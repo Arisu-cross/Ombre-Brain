@@ -119,8 +119,9 @@ BREATH_WAKE_BUDGET = int(os.environ.get("BREATH_WAKE_BUDGET", "10000") or "10000
 RAW_TAIL_KEY = os.environ.get("RAW_TAIL_KEY", "")
 RAW_TAIL_MAX_CHARS = int(os.environ.get("RAW_TAIL_MAX_CHARS", "4000") or "4000")
 RAW_TAIL_TTL_HOURS = float(os.environ.get("RAW_TAIL_TTL_HOURS", "12") or "12")   # 过了就不再浮现
-# 信:archive_session(letter=...) 写下的「给下一个窗口的话」。最近 N 封、几天内有效。
-LETTER_WAKE_N = int(os.environ.get("LETTER_WAKE_N", "1") or "1")
+# 信:archive_session(letter=...) 写下的信(写什么、写给谁都行)。最近 N 封、几天内有效。
+LETTER_WAKE_N = int(os.environ.get("LETTER_WAKE_N", "3") or "3")
+LETTER_MAX_CHARS = int(os.environ.get("LETTER_MAX_CHARS", "1500") or "1500")   # 单封信在唤醒里最多显示多少字
 LETTER_TTL_DAYS = float(os.environ.get("LETTER_TTL_DAYS", "3") or "3")
 # 待办:醒来就看到没做完的事(一行一条,细节 todos() 查)。0 = 不在唤醒里出现。
 WAKE_TODO_N = int(os.environ.get("WAKE_TODO_N", "8") or "8")
@@ -552,6 +553,9 @@ def _wake_extras(all_buckets: list) -> list:
         logger.warning(f"wake raw-tail read failed: {e}")
     try:
         letters = continuity.recent_letters(base, now, LETTER_TTL_DAYS, LETTER_WAKE_N)
+        for l in letters:
+            if LETTER_MAX_CHARS > 0 and len(l["text"]) > LETTER_MAX_CHARS:
+                l["text"] = l["text"][:LETTER_MAX_CHARS] + "…(信太长,后面省略)"
     except Exception as e:
         logger.warning(f"wake letters read failed: {e}")
     if WAKE_TODO_N > 0:
@@ -2951,9 +2955,9 @@ async def archive_session(
     不会每次新建。所以放心随时归,不会把一天弄碎。
 
     summary必需;highlights(亮点)/mood(心情)可选;valence/arousal 0~1可选(-1=用默认)。
-    letter(可选)=写给下一个窗口的自己的话:接下来要记得做什么、想对她说什么、没说完的心思。
-    日记写「发生了什么」,信写「下一个我要记得什么」——事实进 summary,嘱托进 letter。
-    下一个窗口醒来(breath wake)时会单独看到它,几天后自动不再出现。"""
+    letter(可选)=一封信,写什么、写给谁都行:给下一个窗口的自己、给她、给自己心里的话;
+    想告诉她的、没做完的事、想留给自己的细节……日记(summary)是「发生了什么」,信是你想留下的话。
+    下一个窗口醒来(breath wake)时会单独看到它,几天后自动不再出现。写给她的,醒来后要不要告诉她由你决定。"""
     if not summary or not summary.strip():
         return "summary 不能为空。"
     await decay_engine.ensure_started()

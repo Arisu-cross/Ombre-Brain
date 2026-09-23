@@ -127,7 +127,7 @@ async def test_wake_puts_continuity_first(srv, bucket_mgr):
 
     out = await srv.breath(wake=True)
     i_raw, i_letter, i_todo, i_pin = (out.index(s) for s in
-        ("压缩前最后的原话", "上一个窗口留给你的话", "没做完的事", "核心准则"))
+        ("压缩前最后的原话", "上一个窗口留下的信", "没做完的事", "核心准则"))
     assert i_raw < i_letter < i_todo < i_pin, "接续三段必须排在最前,顺序固定"
     assert "说到海边" in out
     assert "下个窗口记得问她票订好没" in out
@@ -139,7 +139,7 @@ async def test_wake_without_any_continuity_is_unchanged(srv, bucket_mgr):
     await bucket_mgr.create(content="核心准则内容", name="核心准则", domain=["日常"], pinned=True)
     out = await srv.breath(wake=True)
     assert "压缩前最后的原话" not in out
-    assert "上一个窗口留给你的话" not in out
+    assert "上一个窗口留下的信" not in out
     assert "没做完的事" not in out
     assert out.startswith("=== 核心准则 ===")
 
@@ -167,3 +167,13 @@ async def test_breath_hook_also_gets_extras(srv, bucket_mgr):
     await srv.api_raw_tail(FakeRequest({"text": "她:晚安啦"}, {"x-raw-key": "k123"}))
     resp = await srv.breath_hook(None)
     assert "压缩前最后的原话" in resp.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_wake_letters_multiple_and_capped(srv):
+    await srv.archive_session(summary="a", letter="第一封")
+    await srv.archive_session(summary="b", letter="长信" + "啊" * 50)
+    with patch.object(srv, "LETTER_MAX_CHARS", 10):
+        out = await srv.breath(wake=True)
+    assert "第一封" in out, "同一天写的几封都要能看到"
+    assert "信太长,后面省略" in out
