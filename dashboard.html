@@ -589,6 +589,17 @@
     border: 1px solid var(--glass-edge);
     box-shadow: 0 1px 2px var(--shadow-dark-subtle);
   }
+  .letter-row {
+    border: 1px solid var(--border, rgba(128,128,128,.25)); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .letter-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--text-dim); }
+  .letter-body { white-space: pre-wrap; word-break: break-word; line-height: 1.7; }
+  .letter-edit {
+    width: 100%; box-sizing: border-box; font: inherit; line-height: 1.7; padding: 8px;
+    border-radius: 8px; border: 1px solid var(--border, rgba(128,128,128,.35));
+    background: transparent; color: inherit; resize: vertical;
+  }
   .trash-row .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .trash-row .preview { color: var(--text-light); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -986,6 +997,7 @@
   <div class="tab active" data-tab="list">记忆</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
+  <div class="tab" data-tab="letters">信箱</div>
   <div class="tab" data-tab="trash">回收站</div>
   <div class="tab" data-tab="settings">设置</div>
 </div>
@@ -1104,6 +1116,20 @@
       <h3>系统信息</h3>
       <div id="config-readonly" style="font-size:13px;color:var(--text-dim);line-height:1.8;">加载中…</div>
     </div>
+  </div>
+</div>
+
+<!-- 信箱:他归档时 letter 参数写下的信。醒来只看最近几封没过期的;这里能看全部、改、删 -->
+<div class="content" id="letters-view" style="display:none">
+  <div class="config-section">
+    <h3>信箱</h3>
+    <div style="font-size:13px;color:var(--text-dim);line-height:1.8;margin-bottom:16px;" id="letters-note">
+      他归档时顺手写下的信 —— 写什么、写给谁都行。
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:16px;">
+      <button class="filter-btn" onclick="loadLetters()">刷新</button>
+    </div>
+    <div id="letters-list"><div class="loading">加载中…</div></div>
   </div>
 </div>
 
@@ -1447,10 +1473,12 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
     document.getElementById('trash-view').style.display = target === 'trash' ? '' : 'none';
+    document.getElementById('letters-view').style.display = target === 'letters' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
     if (target === 'trash') loadTrash();
+    if (target === 'letters') loadLetters();
     if (target === 'settings') loadSettingsStatus();
   });
 });
@@ -1904,6 +1932,81 @@ async function deleteBucket(id) {
   } catch (e) {
     detailMsg('删除失败: ' + e.message, 'var(--negative)');
   }
+}
+
+// ---- 信箱 ----
+var lettersCache = {};
+async function loadLetters() {
+  var box = document.getElementById('letters-list');
+  box.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    var res = await fetch(BASE + '/api/letters');
+    var data = await res.json();
+    if (data.error) { box.innerHTML = '<div class="loading">' + esc(data.error) + '</div>'; return; }
+    document.getElementById('letters-note').textContent =
+      '他归档时顺手写下的信 —— 写什么、写给谁都行。他醒来时只会看到最近 ' + data.wake_n +
+      ' 封、' + data.ttl_days + ' 天内的;标着「醒来会看到」的就是那几封。';
+    var items = data.letters || [];
+    lettersCache = {};
+    if (!items.length) { box.innerHTML = '<div class="loading">还没有信。</div>'; return; }
+    var shown = 0;
+    box.innerHTML = items.map(function(l) {
+      lettersCache[l.id] = l.text;
+      var willSee = l.active && shown < data.wake_n;
+      if (willSee) shown++;
+      var badge = willSee
+        ? '<span style="color:var(--positive, #4caf50);">醒来会看到</span>'
+        : '<span style="color:var(--text-light);">' + (l.active ? '排不上(只看最近几封)' : '已过期,不再出现') + '</span>';
+      return '<div class="letter-row" id="letter-' + escAttr(l.id) + '">' +
+        '<div class="letter-head"><span>' + esc((l.at || '').slice(0, 16).replace('T', ' ')) + '</span>' + badge + '</div>' +
+        '<div class="letter-body">' + esc(l.text) + '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+          '<button class="filter-btn" onclick="editLetter(\'' + escAttr(l.id) + '\')">编辑</button>' +
+          '<button class="filter-btn danger-btn" onclick="deleteLetter(\'' + escAttr(l.id) + '\')">删除</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    box.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+function editLetter(id) {
+  var row = document.getElementById('letter-' + id);
+  if (!row) return;
+  var body = row.querySelector('.letter-body');
+  var btns = body.nextElementSibling;
+  body.innerHTML = '<textarea class="letter-edit" rows="6"></textarea>';
+  body.querySelector('textarea').value = lettersCache[id] || '';
+  btns.innerHTML =
+    '<button class="filter-btn" onclick="saveLetter(\'' + escAttr(id) + '\')">保存</button>' +
+    '<button class="filter-btn" onclick="loadLetters()">取消</button>';
+}
+
+async function saveLetter(id) {
+  var row = document.getElementById('letter-' + id);
+  var text = row ? row.querySelector('textarea').value : '';
+  if (!text.trim()) { alert('信不能是空的 —— 想删就用删除。'); return; }
+  try {
+    var res = await authFetch(BASE + '/api/letters/' + encodeURIComponent(id), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: text }),
+    });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { alert('保存失败: ' + (data.error || res.status)); return; }
+    await loadLetters();
+  } catch (e) { alert('保存失败: ' + e.message); }
+}
+
+async function deleteLetter(id) {
+  if (!confirm('删掉这封信?\n\n删了就没了,不进回收站。')) return;
+  try {
+    var res = await authFetch(BASE + '/api/letters/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok || data.error) { alert('删除失败: ' + (data.error || res.status)); return; }
+    await loadLetters();
+  } catch (e) { alert('删除失败: ' + e.message); }
 }
 
 // ---- 回收站 ----

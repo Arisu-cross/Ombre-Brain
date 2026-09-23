@@ -3079,6 +3079,56 @@ async def archive_session(
 
 
 # =============================================================
+# /api/letters — 面板上的信箱:看全部信、改、删(沈渡醒来只看最近几封没过期的)
+# =============================================================
+@mcp.custom_route("/api/letters", methods=["GET"])
+async def api_letters_list(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        letters = continuity.list_letters(config["buckets_dir"], now_local(), LETTER_TTL_DAYS)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"letters": letters, "ttl_days": LETTER_TTL_DAYS, "wake_n": LETTER_WAKE_N})
+
+
+@mcp.custom_route("/api/letters/{letter_id}", methods=["POST"])
+async def api_letter_edit(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    text = body.get("text") if isinstance(body, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"error": "信不能是空的(想删就用删除)"}, status_code=400)
+    try:
+        ok = continuity.update_letter(config["buckets_dir"], request.path_params["letter_id"], text)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    if not ok:
+        return JSONResponse({"error": "找不到这封信"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+@mcp.custom_route("/api/letters/{letter_id}", methods=["DELETE"])
+async def api_letter_delete(request):
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        ok = continuity.delete_letter(config["buckets_dir"], request.path_params["letter_id"])
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    if not ok:
+        return JSONResponse({"error": "找不到这封信"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+# =============================================================
 # /api/raw-tail — shim 在压缩前一刻写入「最后的原话」(见 continuity.py)
 # 鉴权单独一把钥匙(RAW_TAIL_KEY),不借面板密码;没设 = 接口关闭。
 # =============================================================

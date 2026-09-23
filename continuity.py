@@ -12,8 +12,10 @@
 # 也不用在人设里给「归档不写逐句复述」开豁免。
 # ============================================================
 
+import hashlib
 import json
 import os
+import uuid
 from datetime import datetime, timedelta
 
 RAW_TAIL_FILE = ".raw_tail.json"
@@ -72,12 +74,84 @@ def load_raw_tail(base_dir: str, now: datetime, ttl_hours: float = 12):
     return {"at": d["at"], "text": text}
 
 
+def _letter_id(d: dict) -> str:
+    """信的编号:新信写入时自带;早先没带编号的旧信,按时间+内容算一个(稳定,不会每次变)。"""
+    if d.get("id"):
+        return str(d["id"])
+    raw = f"{d.get('at', '')}\n{d.get('text', '')}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
 def append_letter(base_dir: str, text: str, at: str) -> None:
     text = (text or "").strip()
     if not text:
         return
+    rec = {"id": uuid.uuid4().hex[:12], "at": at, "text": text}
     with open(os.path.join(base_dir, LETTERS_FILE), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"at": at, "text": text}, ensure_ascii=False) + "\n")
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _read_letter_lines(base_dir: str) -> list:
+    """原样读出每一行:能解析的给 dict,坏行保留原文(改/删时原样写回,不丢)。"""
+    try:
+        with open(os.path.join(base_dir, LETTERS_FILE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+            out.append(d if isinstance(d, dict) else line)
+        except ValueError:
+            out.append(line)
+    return out
+
+
+def list_letters(base_dir: str, now: datetime, ttl_days: float = 3) -> list:
+    """全部信(面板用),新的在前;active=醒来时还会看到(没过期)。"""
+    out = []
+    for d in _read_letter_lines(base_dir):
+        if not isinstance(d, dict) or not (d.get("text") or "").strip():
+            continue
+        at = _parse(d.get("at"))
+        active = bool(at) and (ttl_days <= 0 or now - at <= timedelta(days=ttl_days))
+        out.append({"id": _letter_id(d), "at": d.get("at", ""), "text": d["text"], "active": active})
+    out.sort(key=lambda x: x["at"], reverse=True)
+    return out
+
+
+def _rewrite_letters(base_dir: str, items: list) -> None:
+    body = "".join(
+        (json.dumps(d, ensure_ascii=False) if isinstance(d, dict) else d) + "\n" for d in items
+    )
+    _write_atomic(os.path.join(base_dir, LETTERS_FILE), body)
+
+
+def update_letter(base_dir: str, letter_id: str, text: str) -> bool:
+    """改信的内容(时间不变)。找不到返回 False。"""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("信不能是空的(想删就用删除)")
+    items = _read_letter_lines(base_dir)
+    for d in items:
+        if isinstance(d, dict) and _letter_id(d) == letter_id:
+            d["id"] = letter_id          # 旧信第一次被改时把编号固定下来,改了内容也不变
+            d["text"] = text
+            _rewrite_letters(base_dir, items)
+            return True
+    return False
+
+
+def delete_letter(base_dir: str, letter_id: str) -> bool:
+    items = _read_letter_lines(base_dir)
+    keep = [d for d in items if not (isinstance(d, dict) and _letter_id(d) == letter_id)]
+    if len(keep) == len(items):
+        return False
+    _rewrite_letters(base_dir, keep)
+    return True
 
 
 def recent_letters(base_dir: str, now: datetime, ttl_days: float = 3, n: int = 1) -> list:

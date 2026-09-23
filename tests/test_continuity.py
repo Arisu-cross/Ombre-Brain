@@ -177,3 +177,67 @@ async def test_wake_letters_multiple_and_capped(srv):
         out = await srv.breath(wake=True)
     assert "第一封" in out, "同一天写的几封都要能看到"
     assert "信太长,后面省略" in out
+
+
+# ---------- 信箱(面板):看全部 / 改 / 删 ----------
+
+def test_letters_list_edit_delete(tmp_path):
+    d = str(tmp_path)
+    continuity.append_letter(d, "写给她", "2026-09-23T08:00:00")
+    continuity.append_letter(d, "写给自己", "2026-09-10T08:00:00")
+    with open(tmp_path / continuity.LETTERS_FILE, "a", encoding="utf-8") as f:
+        f.write('{"at":"2026-09-20T08:00:00","text":"没编号的旧信"}\n')
+        f.write("坏行\n")
+    now = datetime(2026, 9, 23, 12)
+    ls = continuity.list_letters(d, now, ttl_days=3)
+    assert [l["text"] for l in ls] == ["写给她", "没编号的旧信", "写给自己"]
+    assert [l["active"] for l in ls] == [True, False, False]
+    old_id = ls[1]["id"]
+    assert continuity.list_letters(d, now)[1]["id"] == old_id, "旧信编号要稳定"
+
+    assert continuity.update_letter(d, old_id, "改过的旧信")
+    ls2 = continuity.list_letters(d, now)
+    assert [l["text"] for l in ls2][1] == "改过的旧信" and ls2[1]["id"] == old_id, "改了内容编号不变"
+    assert ls2[1]["at"] == "2026-09-20T08:00:00", "改信不改时间"
+
+    assert continuity.delete_letter(d, ls[0]["id"])
+    assert [l["text"] for l in continuity.list_letters(d, now)] == ["改过的旧信", "写给自己"]
+    assert "坏行" in (tmp_path / continuity.LETTERS_FILE).read_text(encoding="utf-8"), "坏行原样保留"
+    assert not continuity.delete_letter(d, "不存在")
+    assert not continuity.update_letter(d, "不存在", "x")
+    with pytest.raises(ValueError):
+        continuity.update_letter(d, old_id, "   ")
+
+
+class AuthedReq(FakeRequest):
+    def __init__(self, body=None, path_params=None):
+        super().__init__(body)
+        self.path_params = path_params or {}
+
+
+@pytest.mark.asyncio
+async def test_api_letters_crud(srv):
+    with patch.object(srv, "_require_auth", lambda r: None):
+        await srv.archive_session(summary="x", letter="第一封信")
+        data = json.loads((await srv.api_letters_list(AuthedReq())).body)
+        lid = data["letters"][0]["id"]
+        assert data["letters"][0]["text"] == "第一封信" and data["letters"][0]["active"]
+
+        assert (await srv.api_letter_edit(AuthedReq({"text": " "}, {"letter_id": lid}))).status_code == 400
+        assert (await srv.api_letter_edit(AuthedReq({"text": "改"}, {"letter_id": "nope"}))).status_code == 404
+        assert (await srv.api_letter_edit(AuthedReq({"text": "改好的信"}, {"letter_id": lid}))).status_code == 200
+        assert "改好的信" in await srv.breath(wake=True), "改过的信醒来时看到的是新内容"
+
+        assert (await srv.api_letter_delete(AuthedReq(None, {"letter_id": lid}))).status_code == 200
+        assert "改好的信" not in await srv.breath(wake=True)
+        assert (await srv.api_letter_delete(AuthedReq(None, {"letter_id": lid}))).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_api_letters_require_login(srv):
+    from starlette.responses import JSONResponse
+    deny = lambda r: JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with patch.object(srv, "_require_auth", deny):
+        assert (await srv.api_letters_list(AuthedReq())).status_code == 401
+        assert (await srv.api_letter_edit(AuthedReq({"text": "x"}, {"letter_id": "a"}))).status_code == 401
+        assert (await srv.api_letter_delete(AuthedReq(None, {"letter_id": "a"}))).status_code == 401
