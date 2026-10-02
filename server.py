@@ -3128,6 +3128,46 @@ async def api_letter_delete(request):
     return JSONResponse({"ok": True})
 
 
+# ---- 自动浮现:她每句话前,shim 先来问「有没有一件确实相关的旧事」(recall.py 有完整规矩)----
+# 只读:不 touch、不刷 last_active(自动递的不算「他想起来了」,算了会滚雪球)。
+# 鉴权单独一把钥匙 OMBRE_RECALL_TOKEN;没设 = 接口关闭(404)。
+@mcp.custom_route("/api/recall", methods=["GET"])
+async def api_recall(request):
+    from starlette.responses import JSONResponse
+    import recall as _recall
+    token = os.environ.get("OMBRE_RECALL_TOKEN", "").strip()
+    if not token:
+        return JSONResponse({"error": "recall disabled"}, status_code=404)
+    auth = request.headers.get("authorization", "")
+    given = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not given or not hmac.compare_digest(given, token):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    query = _recall.clean_query((request.query_params.get("q", "") or "")[:2000])
+    if len(query) < 2:
+        return JSONResponse({"pick": None, "reason": "empty_query", "candidates": []})
+
+    def _num(name, default, lo, hi):
+        try:
+            return max(lo, min(hi, float(request.query_params.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+
+    max_chars = int(_num("n", 240, 60, 800))
+    min_age = _num("min_age_hours", 24, 0, 24 * 30)
+    exclude = [x for x in request.query_params.get("exclude", "").split(",") if x.strip()]
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        matches = await bucket_mgr.search(query, limit=20, use_embedding=False, all_buckets=all_buckets)
+        for b in matches:
+            b["content"] = strip_wikilinks(b.get("content", ""))
+        return JSONResponse(_recall.pick(query, matches, all_buckets, now_local(),
+                                         min_age_hours=min_age, max_chars=max_chars,
+                                         exclude_ids=exclude, is_expired=_is_expired))
+    except Exception as e:
+        logger.warning(f"recall failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # =============================================================
 # /api/raw-tail — shim 在压缩前一刻写入「最后的原话」(见 continuity.py)
 # 鉴权单独一把钥匙(RAW_TAIL_KEY),不借面板密码;没设 = 接口关闭。

@@ -47,3 +47,6 @@ httpx>=0.27.0,<0.29
 # 向量相似度计算 (导入模式/聚类)
 numpy>=1.24.0,<3
 scikit-learn>=1.2.0,<2
+
+# 繁 → 简(自动浮现:语音转写常是繁体,记忆库是简体)。Apache-2.0;别换成 zhconv(GPL)
+opencc-python-reimplemented>=0.1.7,<0.2.0
