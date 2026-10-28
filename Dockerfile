@@ -8,6 +8,10 @@
 
 FROM python:3.12-slim
 
+# git:每日备份(backup_engine.py)要 clone/push 备份仓库。slim 镜像不带,缺了它备份每天静默失败
+# (2026-10 搬离 Zeabur 后照这份 Dockerfile 重建,连着失败了 7 天才发现 —— Zeabur 的环境自带 git)。
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install dependencies first (leverage Docker cache)
